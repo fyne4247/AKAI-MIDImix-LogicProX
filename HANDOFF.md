@@ -101,35 +101,28 @@ argument for the translator in §5.
 Separately: **Latch vs Touch is Logic's per-track automation mode**, unrelated to any of
 this, and works regardless of route. Nothing to configure.
 
-### 3.5 The four fixed buttons — measured, they transmit nothing
+### 3.5 The four fixed buttons — Phase 3 correction
 
 The panel has **20 physical buttons** (8 MUTE, 8 REC ARM, SEND ALL, BANK LEFT, BANK
 RIGHT, SOLO) but the preset stores **24 button records**. The extra row of 8 is the
 SOLO-shifted MUTE layer. **Now confirmed on the wire.**
 
-Measurement: a 70-second full-panel sweep, 1101 messages, produced hits on exactly the
-57 preset addresses and **nothing outside them**.
+The original 70-second full-panel sweep saw only the 57 programmable preset
+addresses. Its reporting collapsed Note and CC messages into the same label,
+which led to the wrong conclusion about the fixed buttons. The Phase 3 focused
+capture settled the wire protocol; see `phase3handoff.md` for the full record.
 
-- **BANK LEFT / BANK RIGHT — contradictory results.** First measurement (70s sweep,
-  1101 messages) found nothing outside the 57 preset addresses — concluded they transmit
-  nothing. Second measurement (2026-07-27, later run) showed BANK LEFT producing
-  ch1 CC25 and BANK RIGHT producing ch1 CC26. Those are **knob row3 strip5 / strip6
-  addresses in the mGB preset**, so either (a) the bank buttons share addressing with
-  those knobs, or (b) they were accidentally bumped. **Not settled — needs a focused
-  retest with hands off the knobs.** If they do transmit on those CCs, they are
-  mappable after all but will collide with the knobs unless the logic-mode preset
-  moves them apart.
+- **BANK LEFT / BANK RIGHT — resolved.** They send ch1 **Note 25** and
+  **Note 26**, respectively (press `90 19/1a 7f`, release `80 19/1a 7f`). They
+  do not collide with knob CC25/26: note and CC are distinct MIDI message types.
+  The bridge translates them to MCU Bank Left/Right and live verification passed.
 - **SEND ALL** retransmits control positions. Second run showed it sending the first
   5 controls with non-zero positions (knob row1 strips 1/3/5/7 and fader MASTER).
   No message of its own — exactly as the manual describes.
-- **SOLO behaviour is inconsistent across runs.** First run: toggle (press once to arm,
-  again to leave). Second run: hold, matching the manual. The firmware may have two
-  modes, or the state may depend on power-cycle / bank state. Releasing SOLO on the
-  second run also produced a ch1 CC27 (knob row3 strip7) message — possibly a
-  physical bump, possibly firmware. **Not settled.**
-- **Button press behaviour is mixed** — some momentary (127 on press, 0 on release),
-  some toggling (127, then 0 on the next press). Indistinguishable on the wire: a
-  receiver sees only a CC going to 127 and later to 0.
+- **SOLO — partially resolved.** The fixed SOLO button is ch1 Note 27. Its desired
+  bridge behavior (solo modifier/layer) remains to be implemented.
+- **Button press behaviour varies.** For the fixed bank buttons, the wire form is
+  ordinary Note On on press and Note Off on release.
 - **The LEDs do not respond to MIDI feedback — confirmed.** Tested with working
   output (the outbound pack(4) fix verified by selftest round-trip). Neither CC
   nor Note On messages on any channel light any lamp. The LEDs are firmware-internal
@@ -324,12 +317,21 @@ Commands: `f <1-9> <0-127>` | `sweep` | `ping` | `status` | `q`
 Also: `echo '…' > .mcu_cmd` for a second-terminal inject.
 
 ### Phase 2 — faders only
-MCU faders are **14-bit Pitch Bend**, one MIDI channel per strip: channels 1–8 for strips
-1–8, channel 9 for master. Map MIDI Mix fader CC (7-bit) → pitch bend (14-bit).
-Verify all 9 move the right tracks in Logic. Stop here and confirm with the user before
-continuing.
 
-### Phase 3 — buttons
+**Status 2026-07-27: PASSED.** See `phase2handoff.md` for the complete, current
+setup and verification record. Real MIDI Mix faders 1–8 (mGB ch1 CC61–68) now
+drive the first eight-strip Logic Control bank. The physical MASTER (mGB ch1
+CC69) uses the separate stable virtual `MIDI Mix Fixed` port (ch16 CC119) and
+has a one-time Logic assignment to the actual Master channel, so it never
+follows the bank. The virtual surface must connect as base Logic Control
+**`0x10`**, not the `0x11` extender identity, or banking will not work.
+
+### Phase 3 — physical banking and buttons
+**Status 2026-07-27: banking PASSED; channel-button mapping remains.** See
+`phase3handoff.md` for the current hardware protocol and setup. The physical
+BANK LEFT/RIGHT controls are ch1 **Note 25/26**, not CC25/26; the bridge now
+translates them to MCU Bank Left/Right and the user confirmed both work.
+
 MCU buttons are Note On/Off on channel 1, velocity 127 = press, 0 = release. Note numbers
 (**verify against a reference before trusting**):
 
@@ -345,16 +347,15 @@ Channel Left 48  Channel Right 49
 Map MIDI Mix MUTE row → MUTE, REC ARM row → REC/RDY, SOLO+MUTE layer → SOLO.
 
 ### Phase 4 — banking
-**BANK LEFT/RIGHT are dead ends** — Phase 0 measured them transmitting nothing (§3.5),
-so MCU notes 46/47 cannot be driven from them. Pick one instead:
+**Status 2026-07-27: PASSED.** Physical BANK LEFT/RIGHT now drive MCU Bank
+Left/Right through the bridge. Do not repurpose REC ARM 7/8. For track-only
+banking, set the Logic control-surface group's Channel Strip View Mode to
+Arrange or Tracks rather than All; see `phase3handoff.md`.
 
-- **Repurpose two buttons.** REC ARM 7 and 8 are the obvious candidates; the translator
-  maps them to MCU notes 46/47 rather than to record-enable. Costs two record-arms.
-- **Logic key command.** Leave the panel out of it entirely. Costs nothing, but means
-  reaching for the keyboard.
-
-Recommendation: repurpose REC ARM 7/8, since the whole point is to stop touching the
-keyboard. Make it a constant at the top of the daemon so it is trivial to change.
+**Non-negotiable product requirement (confirmed 2026-07-27):** the physical MIDI Mix
+**MASTER fader must remain permanently mapped to Logic's Master channel**. It must never
+follow the eight-strip MCU bank. **Resolved in Phase 2:** it uses `MIDI Mix Fixed`
+ch16 CC119, assigned directly to Logic's Master volume.
 
 ### Phase 5 — knobs (pan / sends) and soft-takeover
 MCU V-Pots are **relative** encoders on CC 16–23, encoded as 0x01–0x3F = clockwise ticks,
@@ -372,9 +373,9 @@ documentation of the Logic-side setup. Commit and update README.
 
 ## 7. Outstanding unknowns
 
-Resolved since the first draft: BANK LEFT/RIGHT **do not transmit** (§3.5); the monitor
-**does** work against hardware; the button record byte order is `(channel, type, cc)`
-(§3.3); the SOLO-shift layer is real and SOLO toggles rather than holds.
+Resolved since the first draft: BANK LEFT/RIGHT **do transmit** as Note 25/26
+(§3.5); the monitor **does** work against hardware; the button record byte order is
+`(channel, type, cc)` (§3.3); and the SOLO-shift layer is real.
 
 Still open:
 
@@ -388,8 +389,7 @@ Still open:
    behaviour is mixed, so `type` is probably not the only factor. Low priority — it does
    not affect addressing, which is all Logic sees.
 4. **Whether `0x66` is really the preset read opcode.** Never tested. Harmless to try.
-5. **Banking without hardware support.** Since BANK L/R are dead, decide between a Logic
-   key command and repurposing two REC ARM buttons.
+5. ~~Banking without hardware support.~~ **Resolved:** physical BANK L/R are live.
 6. ~~Challenge r1 form.~~ **Resolved: `c2 >> 4`** matches Logic. Ardour's `c2 >> c3` is
    wrong for this host.
 7. ~~Outbound fader → Logic volume.~~ **User confirmed volume fader moved** (2026-07-27).

@@ -13,8 +13,9 @@ Handshake (device side — TouchMCU protocol notes + Ardour host code)
     host  ->  F0 00 00 66 dd 13 00 F7                       Version Request (optional)
     device->  F0 00 00 66 dd 14 <5 version> F7              Version Reply
 
-`dd` is 0x14 (Mackie Control) or 0x10 (Logic Control). Logic's Install UI uses
-the Logic Control *module* for both models, so we announce on both IDs.
+Logic probes several identities on a new port. This bridge answers only as the
+base Logic Control (`dd = 0x10`): answering `0x11` creates a Logic Control XT
+extender, whose faders work but whose bank buttons do not own navigation.
 
 Faders are 14-bit Pitch Bend (ch 1-8 = strips, ch 9 = master). Logic's default
 is touch-sensitive: we send Note On 104-112 (touch) around each move.
@@ -64,9 +65,11 @@ import midimix as M  # noqa: E402
 # --------------------------------------------------------------------------
 
 PORT_NAME = "MIDI Mix MCU"
-DEVICE_ID_MCU = 0x14          # Mackie Control Universal
+FIXED_PORT_NAME = "MIDI Mix Fixed"
 DEVICE_ID_LC = 0x10           # Emagic Logic Control
-ANNOUNCE_IDS = (DEVICE_ID_MCU, DEVICE_ID_LC)
+# Do not answer 0x11 / 0x15: they are extender identities. Logic's base
+# controller on 0x10 is the member that receives Bank Left/Right commands.
+ANNOUNCE_IDS = (DEVICE_ID_LC,)
 SERIAL = b"MIDIMix"           # 7 ASCII bytes
 VERSION = b"V1.00"            # 5 ASCII bytes
 CLIENT_NAME = "mcu_surface.py"
@@ -89,6 +92,34 @@ CMD_RESET = 0x63
 
 # Fader touch notes (ch 1): strip1=104 … strip8=111, master=112
 TOUCH_NOTE_BASE = 104
+
+# The current mgb70 preset leaves the fixed panel buttons on their firmware
+# notes: BANK LEFT=25, BANK RIGHT=26, SOLO=27. Its third knob row was moved to
+# CC71..78, so the fixed buttons cannot collide with it.
+# Its nine faders remain channel 1 (wire channel 0), CC61 through CC69.
+MGB_FADER_CCS = {61 + i: i + 1 for i in range(9)}
+MGB_BANK_BUTTON_NOTES = {25: "left", 26: "right"}
+FADER_TOUCH_RELEASE_SECS = 0.18
+
+# Logic currently maps MCU strip 8 to its Stereo Out, but does not act on the
+# dedicated MCU master-fader lane (strip 9). Keep the physical MASTER useful by
+# routing it to that proven Stereo Out lane. This is deliberately a constant:
+# banking can later choose whether it follows the MCU bank or gets a dedicated
+# fixed-output route.
+PHYSICAL_MASTER_TARGET_STRIP = 8
+
+# A separate stable virtual source for the one thing that must never follow an
+# MCU bank: the physical MASTER fader → Logic Master volume. It is kept
+# separate from the MCU port so Logic can learn exactly one fixed Controller
+# Assignment without colliding with control-surface messages.
+FIXED_MASTER_STATUS = 0xBF  # MIDI channel 16; deliberately outside mGB use
+FIXED_MASTER_CC = 119
+
+# MCU navigation buttons (channel 1). Bank moves by eight channel strips;
+# Channel moves by one. We use only Bank for the physical eight-fader layout.
+MCU_BANK_LEFT_NOTE = 46
+MCU_BANK_RIGHT_NOTE = 47
+MCU_HOME_BANK_PRESSES = 16
 
 
 # --------------------------------------------------------------------------
@@ -164,6 +195,39 @@ def parse_mackie_sysex(msg: bytes):
     return msg[4], msg[5], msg[6:-1]
 
 
+def parse_mgb_fader(msg: bytes):
+    """Return ``(strip, value)`` for a current-preset MIDI Mix fader CC."""
+    if len(msg) < 3 or msg[0] != 0xB0:
+        return None
+    strip = MGB_FADER_CCS.get(msg[1])
+    return (strip, msg[2]) if strip is not None else None
+
+
+def parse_mgb_bank_button(msg: bytes):
+    """Return ``(direction, pressed)`` for mgb70's fixed bank buttons.
+
+    These hardware buttons are firmware-fixed Note 25/26. In the original mGB
+    preset those note numbers were easily confused with knob CC25/26; mgb70
+    moves that knob row to CC71..78, making the separation obvious.
+    """
+    if len(msg) < 3:
+        return None
+    kind, channel = msg[0] & 0xF0, msg[0] & 0x0F
+    if channel != 0 or kind not in (0x90, 0x80):
+        return None
+    direction = MGB_BANK_BUTTON_NOTES.get(msg[1])
+    if direction is None:
+        return None
+    return direction, kind == 0x90 and msg[2] != 0
+
+
+def mcu_button_press(note: int) -> list:
+    """Return a complete press/release for an MCU button on channel 1."""
+    if not 0 <= note <= 127:
+        raise ValueError(f"MCU note must be 0..127, got {note}")
+    return [bytes([0x90, note, 127]), bytes([0x80, note, 0])]
+
+
 # --------------------------------------------------------------------------
 # single-instance lock
 # --------------------------------------------------------------------------
@@ -201,7 +265,7 @@ def _acquire_pid_lock():
 class VirtualMCU:
     def __init__(self, name: str = PORT_NAME):
         self.name = name
-        self.device_id = DEVICE_ID_MCU  # last id Logic spoke to
+        self.device_id = DEVICE_ID_LC  # the one base identity we emulate
         self.challenges = {did: make_challenge() for did in ANNOUNCE_IDS}
         self.connected = False
         self.connected_id = None
@@ -212,8 +276,16 @@ class VirtualMCU:
         # Last fader positions Logic sent us (0..1), keyed by strip 1..9
         self.host_faders = {}
         self._lock = threading.Lock()
+        self._mix_msg_count = 0
+        self._mix_last_value = {}
+        self._mix_touches = {}  # strip -> monotonic release deadline
+        self.mix_connected = False
+        # The one-time Logic assignment on MIDI Mix Fixed is now the permanent
+        # Master route. It remains independent of every MCU bank.
+        self.master_route = "fixed"
 
         self._on_dest_read = M.READ_PROC(self._dest_callback)
+        self._on_mix_read = M.READ_PROC(self._mix_callback)
 
         self.client = M.Ref()
         err = M._cm.MIDIClientCreate(
@@ -237,6 +309,12 @@ class VirtualMCU:
         if err:
             raise SystemExit(f"MIDISourceCreate({name!r}) failed: {err}")
 
+        self.fixed_source = M.Ref()
+        err = M._cm.MIDISourceCreate(
+            self.client, M._cfstr(FIXED_PORT_NAME), ctypes.byref(self.fixed_source))
+        if err:
+            raise SystemExit(f"MIDISourceCreate({FIXED_PORT_NAME!r}) failed: {err}")
+
         self.dest = M.Ref()
         err = M._cm.MIDIDestinationCreate(
             self.client, M._cfstr(name), self._on_dest_read, None,
@@ -244,19 +322,50 @@ class VirtualMCU:
         if err:
             raise SystemExit(f"MIDIDestinationCreate({name!r}) failed: {err}")
 
-        self.log(f"virtual surface up: {name!r}  (announcing as MCU 0x14 and LC 0x10)")
+        # Listen to the physical controller with the same client that owns the
+        # virtual MCU ports. CoreMIDI fans a source out to multiple clients, so
+        # this does not interfere with other MIDI users.
+        self.mix_input = M.Ref()
+        try:
+            mix_source = M.find_endpoint("source")
+        except SystemExit:
+            self.log("real 'MIDI Mix' is not present — virtual probe only")
+        else:
+            err = M._cm.MIDIInputPortCreate(
+                self.client, M._cfstr("MIDI Mix faders"), self._on_mix_read, None,
+                ctypes.byref(self.mix_input))
+            if err:
+                self.log(f"could not listen to real MIDI Mix ({err}) — virtual probe only")
+            else:
+                err = M._cm.MIDIPortConnectSource(self.mix_input, mix_source, None)
+                if err:
+                    self.log(f"could not connect real MIDI Mix ({err}) — virtual probe only")
+                else:
+                    self.mix_connected = True
+                    self.log("listening to MIDI Mix: faders ch1 CC61–69; "
+                             "banks Note25/26 (mgb70 preset)")
+
+        self.log(f"virtual surface up: {name!r}  (announcing as Logic Control 0x10)")
         self.log("delete any Control Surface that still points at the real 'MIDI Mix'")
 
     def log(self, text: str):
         print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
 
-    def emit(self, msg: bytes, note: str = ""):
+    def emit(self, msg: bytes, note: str = "", log: bool = True):
         err = M._cm.MIDIReceived(self.source, M._packet_list(msg))
         if err:
             self.log(f"MIDIReceived failed ({err}): {msg.hex(' ')}")
             return
-        tag = f"  ({note})" if note else ""
-        self.log(f"→ host  {msg.hex(' ')}{tag}")
+        if log:
+            tag = f"  ({note})" if note else ""
+            self.log(f"→ host  {msg.hex(' ')}{tag}")
+
+    def emit_fixed_master(self, value_7bit: int):
+        """Send the stable, learnable master CC on its own virtual MIDI port."""
+        msg = bytes([FIXED_MASTER_STATUS, FIXED_MASTER_CC, value_7bit])
+        err = M._cm.MIDIReceived(self.fixed_source, M._packet_list(msg))
+        if err:
+            self.log(f"fixed-master MIDIReceived failed ({err}): {msg.hex(' ')}")
 
     def send_connection_query(self, device_id: int = None, new_challenge: bool = True,
                               clear_connected: bool = False):
@@ -336,19 +445,40 @@ class VirtualMCU:
             for v in (0, 64, 127, 0):
                 self.send_fader(strip, v, hold_ms=40)
 
+    def send_bank(self, direction: str, count: int = 1):
+        """Ask Logic to move the MCU eight-strip bank left or right."""
+        note = {"left": MCU_BANK_LEFT_NOTE, "right": MCU_BANK_RIGHT_NOTE}.get(direction)
+        if note is None or count < 1:
+            raise ValueError("usage: bank <left|right|home> [count]")
+        for _ in range(count):
+            for msg in mcu_button_press(note):
+                self.emit(msg, f"bank {direction}")
+            self._pump_ms(30)
+        self.log(f"banked {direction} ×{count}")
+
+    def send_bank_home(self):
+        """Saturate Bank Left so Logic lands on its first eight-strip bank."""
+        self.send_bank("left", MCU_HOME_BANK_PRESSES)
+        self.log("bank home requested — faders should now address Logic's first bank")
+
     def status_line(self) -> str:
+        mix_values = ",".join(f"{strip}:{value}" for strip, value in
+                              sorted(self._mix_last_value.items())) or "none"
+        mix = (f"MIDI Mix faders={self._mix_msg_count} last=[{mix_values}]"
+               if self.mix_connected else "MIDI Mix not connected")
+        master = f"master-route={self.master_route}"
         if self.connected:
             return (f"CONNECTED as 0x{self.connected_id:02X}  "
-                    f"host msgs={self.host_msg_count}  touchless={self.touchless}")
+                    f"host msgs={self.host_msg_count}  {mix}  {master}  touchless={self.touchless}")
         if self.host_msg_count > 0:
             # Logic often streams LCD/meters before (or without) a formal
             # Host Connection Reply — still online enough to move faders.
             return (f"ONLINE (no formal handshake yet)  "
                     f"host msgs={self.host_msg_count}  "
                     f"fader-fb strips={sorted(self.host_faders)}  "
-                    f"touchless={self.touchless}")
+                    f"{mix}  {master}  touchless={self.touchless}")
         return ("WAITING for Logic  host msgs=0  "
-                "(Logic Output port is not our dest)")
+                f"{mix}  {master}  (Logic Output port is not our dest)")
 
     # -- from Logic --------------------------------------------------------
 
@@ -359,6 +489,68 @@ class VirtualMCU:
                     self._handle_from_host(msg)
         except Exception as exc:  # noqa: BLE001
             self.log(f"callback error: {exc!r}")
+
+    def _mix_callback(self, pkt_list, _src, _ref):
+        """Translate faders and the collision-free fixed bank buttons."""
+        try:
+            for msg in M._iter_packets(pkt_list):
+                # Keep these two raw diagnostics visible while bringing the
+                # physical buttons online.  They are low-rate and make it
+                # immediately clear whether the bridge saw the press.
+                if len(msg) >= 3 and msg[1] in MGB_BANK_BUTTON_NOTES:
+                    self.log(f"← MIDI Mix  {msg.hex(' ')}  [bank candidate]")
+                event = parse_mgb_fader(msg)
+                if event is not None:
+                    self.forward_midi_mix_fader(*event)
+                    continue
+                bank = parse_mgb_bank_button(msg)
+                if bank is not None:
+                    direction, pressed = bank
+                    # A full MCU press/release is emitted on the physical
+                    # press. The MIDI Mix release CC is only confirmation.
+                    if pressed:
+                        self.send_bank(direction)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"MIDI Mix callback error: {exc!r}")
+
+    def forward_midi_mix_fader(self, strip: int, value_7bit: int):
+        """Forward a physical fader and hold MCU touch while it is in motion.
+
+        This is direct absolute control for Phase 2. Soft takeover needs Logic
+        feedback plus a crossing detector and is intentionally deferred to the
+        next phase rather than guessed at here.
+        """
+        # The fixed port is always emitted. Until the user creates the one-time
+        # Logic assignment it is harmless; the temporary MCU mirror below keeps
+        # MASTER usable through the current mirror in the pre-assignment layout.
+        if strip == 9:
+            self.emit_fixed_master(value_7bit)
+            if self.master_route == "fixed":
+                self._mix_msg_count += 1
+                self._mix_last_value[strip] = value_7bit
+                return
+        target_strip = PHYSICAL_MASTER_TARGET_STRIP if strip == 9 else strip
+        with self._lock:
+            if not self.touchless and target_strip not in self._mix_touches:
+                for msg in fader_touch(target_strip, True):
+                    self.emit(msg, f"MIDI Mix fader {strip} touch DOWN", log=False)
+            self.emit(fader_pitch_bend(target_strip, value_7bit), log=False)
+            self._mix_touches[target_strip] = time.monotonic() + FADER_TOUCH_RELEASE_SECS
+            self._mix_msg_count += 1
+            self._mix_last_value[strip] = value_7bit
+
+    def release_idle_midi_mix_touches(self):
+        """Release touch after the physical fader has been still briefly."""
+        if self.touchless:
+            self._mix_touches.clear()
+            return
+        now = time.monotonic()
+        with self._lock:
+            idle = [strip for strip, deadline in self._mix_touches.items() if deadline <= now]
+            for strip in idle:
+                for msg in fader_touch(strip, False):
+                    self.emit(msg, f"MIDI Mix fader {strip} touch UP", log=False)
+                del self._mix_touches[strip]
 
     def _handle_from_host(self, msg: bytes):
         self.host_msg_count += 1
@@ -389,9 +581,15 @@ class VirtualMCU:
             return
 
         device_id, cmd, payload = parsed
-        # Always reply on the device id Logic addressed — it scans 0x10/11/14/15/17.
+        # Logic probes extender and other Mackie-family IDs too. Replying to an
+        # extender query makes this one eight-fader surface an XT, and Logic
+        # correctly ignores its Bank buttons. Only the base 0x10 owns banking.
+        if device_id not in ANNOUNCE_IDS:
+            if cmd == CMD_DEVICE_QUERY and not self.quiet:
+                self.log(f"ignoring non-base Device Query id=0x{device_id:02X}")
+            return
         reply_id = device_id
-        self.device_id = reply_id if device_id in ANNOUNCE_IDS else self.device_id
+        self.device_id = reply_id
 
         # Handshake / version / offline are always logged. Routine config is quiet.
         noisy_config = cmd in (0x0A, 0x0B, 0x0E, 0x12, 0x20, 0x21, 0x10, 0x11, 0x72)
@@ -457,6 +655,7 @@ class VirtualMCU:
     def close(self):
         try:
             M._cm.MIDIEndpointDispose(self.source)
+            M._cm.MIDIEndpointDispose(self.fixed_source)
             M._cm.MIDIEndpointDispose(self.dest)
             M._cm.MIDIClientDispose(self.client)
         except Exception:  # noqa: BLE001
@@ -508,14 +707,19 @@ def cmd_run():
     print(f"    3. Input + Output both = {PORT_NAME!r}")
     print("    4. Close the Setup window")
     print("    5. Wait until this log shows HANDSHAKE OK / LCD track names")
-    print("    6. Move a fader — either type here, OR from another terminal:")
+    print("    6. Move a physical MIDI Mix fader (mgb70 preset: ch1 CC61–69),")
+    print("       or drive a synthetic fader here / from another terminal:")
     print(f"         echo 'f 1 100' > {_ROOT}/.mcu_cmd")
+    print(f"  Fixed master port: {FIXED_PORT_NAME!r} sends ch16 CC{FIXED_MASTER_CC}")
     print()
-    print("  Verified earlier: Logic completed handshake (algo match) and sent")
-    print("  fader feedback + LCD names. The missing piece was only our outbound")
-    print("  fader test not reaching the live process.")
+    print("  Logic handshake and synthetic fader testing were verified in Phase 1.")
+    print("  This mixer route never moves a Logic fader by itself: it responds only")
+    print("  to physical MIDI Mix movement or an explicit test command.")
     print()
-    print("  commands: f <1-9> <0-127> | sweep | ping | status | q")
+    print("  Phase 2 is direct absolute fader control; soft takeover comes next.")
+    print("  Physical BANK LEFT/RIGHT use fixed ch1 Note25/26 (mgb70 preset).")
+    print("  commands: f <1-9> <0-127> | bank <left|right|home> [count]")
+    print("            | master <mirror|fixed> | sweep | ping | status | q")
     print("=" * 64)
     print()
     print(f"  {surface.status_line()}")
@@ -525,7 +729,6 @@ def cmd_run():
     stop = []
     last_announce = time.monotonic()
     last_status = time.monotonic()
-    auto_fader_sent = False
 
     def _sig(*_):
         stop.append(True)
@@ -536,6 +739,7 @@ def cmd_run():
             M._pump(0.1)
             now = time.monotonic()
             _drain_cmd_file(surface, stop)
+            surface.release_idle_midi_mix_touches()
 
             # Re-announce every 5s until we have seen host traffic.
             if surface.host_msg_count == 0 and now - last_announce >= 5.0:
@@ -545,15 +749,6 @@ def cmd_run():
             if now - last_status >= 15.0:
                 surface.log(surface.status_line())
                 last_status = now
-
-            # Wait until handshake is done AND Logic has pushed fader feedback
-            # (surface fully online), then run a dramatic volume test.
-            if (not auto_fader_sent and surface.connected
-                    and len(surface.host_faders) >= 1
-                    and surface.host_msg_count >= 30):
-                surface._pump_ms(500)  # let Logic settle after handshake
-                surface.send_fader_test(1)
-                auto_fader_sent = True
 
             if sys.stdin.isatty():
                 r, _, _ = select.select([sys.stdin], [], [], 0)
@@ -594,6 +789,25 @@ def _handle_cli(surface: VirtualMCU, line: str, stop: list):
     if cmd == "sweep":
         surface.sweep_faders()
         return
+    if cmd == "bank":
+        direction = parts[1].lower() if len(parts) > 1 else ""
+        try:
+            if direction == "home":
+                surface.send_bank_home()
+            else:
+                count = int(parts[2]) if len(parts) > 2 else 1
+                surface.send_bank(direction, count)
+        except ValueError as exc:
+            print(f"  {exc}")
+        return
+    if cmd == "master" and len(parts) == 2:
+        route = parts[1].lower()
+        if route not in ("mirror", "fixed"):
+            print("  usage: master <mirror|fixed>")
+        else:
+            surface.master_route = route
+            print(f"  physical MASTER route → {route}")
+        return
     if cmd in ("f", "fader") and len(parts) >= 3:
         try:
             surface.send_fader(int(parts[1]), int(parts[2]))
@@ -605,7 +819,8 @@ def _handle_cli(surface: VirtualMCU, line: str, stop: list):
         surface.send_fader_test(strip)
         return
     if cmd == "help":
-        print("  f <strip 1-9> <0-127> | test [strip] | sweep | ping | status | quiet | verbose | q")
+        print("  f <strip 1-9> <0-127> | test [strip] | sweep | bank <left|right|home> [count]")
+        print("  master <mirror|fixed> | ping | status | quiet | verbose | q")
         print("  (fader = volume in Logic mixer; MCU wires it as pitch-bend)")
         return
     print(f"  unknown command {line!r}  (try: help)")
@@ -626,11 +841,11 @@ def cmd_selfcheck():
 
     print("\nsysex builders")
     ch = make_challenge()
-    q = msg_host_connection_query(ch, DEVICE_ID_MCU)
+    q = msg_host_connection_query(ch, DEVICE_ID_LC)
     check("query length 18", len(q) == 18)
-    check("query header MCU", q[:6] == bytes([0xF0, 0x00, 0x00, 0x66, 0x14, 0x01]))
-    qlc = msg_host_connection_query(ch, DEVICE_ID_LC)
-    check("query header LC", qlc[4] == 0x10)
+    check("query header base Logic Control", q[:6] ==
+          bytes([0xF0, 0x00, 0x00, 0x66, 0x10, 0x01]))
+    check("only base identity is announced", ANNOUNCE_IDS == (DEVICE_ID_LC,))
 
     print("\nfader messages")
     check("pb strip1 @0", fader_pitch_bend(1, 0) == bytes([0xE0, 0x00, 0x00]))
@@ -638,6 +853,23 @@ def cmd_selfcheck():
     check("touch down note 104", fader_touch(1, True) == [bytes([0x90, 104, 127])])
     check("touch up has note-off", fader_touch(1, False)[1] == bytes([0x80, 104, 0]))
     check("master touch note 112", fader_touch(9, True)[0][1] == 112)
+    check("bank left is MCU note 46", mcu_button_press(MCU_BANK_LEFT_NOTE) ==
+          [bytes([0x90, 46, 127]), bytes([0x80, 46, 0])])
+    check("bank right is MCU note 47", mcu_button_press(MCU_BANK_RIGHT_NOTE) ==
+          [bytes([0x90, 47, 127]), bytes([0x80, 47, 0])])
+
+    print("\nMIDI Mix mGB fader routing")
+    check("CC61 maps to strip 1", parse_mgb_fader(bytes([0xB0, 61, 77])) == (1, 77))
+    check("CC69 maps to master", parse_mgb_fader(bytes([0xB0, 69, 12])) == (9, 12))
+    check("other channel ignored", parse_mgb_fader(bytes([0xB1, 61, 77])) is None)
+    check("knob CC ignored", parse_mgb_fader(bytes([0xB0, 21, 77])) is None)
+    check("Note25 is physical bank left", parse_mgb_bank_button(bytes([0x90, 25, 127])) ==
+          ("left", True))
+    check("Note26 release is bank right up", parse_mgb_bank_button(bytes([0x80, 26, 127])) ==
+          ("right", False))
+    check("CC75 is not a bank button", parse_mgb_bank_button(bytes([0xB0, 75, 127])) is None)
+    check("fixed master uses isolated CC119", (FIXED_MASTER_STATUS, FIXED_MASTER_CC) ==
+          (0xBF, 119))
 
     print("\nvirtual port creation")
     try:

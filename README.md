@@ -102,6 +102,12 @@ python3 tools/selftest.py                   # parser + preset round-trip tests
 python3 tools/mcu_surface.py selfcheck      # algorithm + port create, no Logic
 # In Logic: Control Surfaces → Setup → Install → Mackie Designs → Mackie Control
 # set Input/Output to "MIDI Mix MCU", then in the probe type:  f 1 100
+# Phase 2 — no preset flash required: with the current mGB preset loaded,
+# physical faders ch1 CC61–69 drive Logic volume strips 1–8 plus master.
+# This initial route is direct/absolute; soft takeover is a later refinement.
+# `bank home` / `bank left` / `bank right` are available in the running bridge.
+# The fixed `MIDI Mix Fixed` port emits MASTER as ch16 CC119, reserved for one
+# stable Logic assignment to Master that will not follow MCU banking.
 ```
 
 ### A note on `MIDIPacketList`
@@ -190,11 +196,10 @@ After a mapping session: quit Logic (it flushes the `.cs` on exit), then re-copy
 - **SEND ALL** retransmits every control's current position, so software can sync to the
   physical positions. The manual notes it may do nothing if the software uses pickup or
   takeover mode.
-- **BANK LEFT / RIGHT — not settled.** First run (70s sweep, 1101 messages) found
-  nothing outside the 57 preset addresses. Second run saw ch1 CC25 from BANK LEFT
-  and ch1 CC26 from BANK RIGHT — but those are knob row3 strip5/6 addresses, so
-  a physical bump cannot be ruled out. Needs a focused retest with hands off the
-  knobs.
+- **BANK LEFT / RIGHT — resolved in Phase 3.** They send ch1 **Note 25/26**,
+  respectively—not CC25/26—and are now translated to Logic's MCU Bank
+  Left/Right. Note and CC with the same number do not collide. See
+  `phase3handoff.md`.
 - **SOLO behaviour is inconsistent.** First run: toggle (press to arm, press to
   leave). Second run: hold, matching the manual. May depend on power-cycle or
   bank state.
