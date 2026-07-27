@@ -3,7 +3,7 @@
 
 Subcommands:
     show <preset.midimix>       decode a preset to a readable table
-    mon  [preset.midimix]       live-monitor the device, labelled via a preset
+    mon  [preset.midimix] [secs] live-monitor the device, labelled via a preset
     send <preset.midimix>       flash a preset to the device
     dump [out.midimix]          ask the device for its current config
 
@@ -152,29 +152,45 @@ _cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_lo
 _cf.CFRunLoopRunInMode.restype = ctypes.c_int32
 _cf.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
 
+# CoreMIDI's MIDIObjectRef / MIDIClientRef / MIDIPortRef / MIDIEndpointRef are
+# all UInt32 typedefs, NOT pointers. And every argtypes list below is mandatory:
+# without it ctypes passes 64-bit CFStringRef pointers as 32-bit ints, truncating
+# them, and the process dies inside CoreMIDI with no Python traceback.
+Ref = ctypes.c_uint32
+RefP = ctypes.POINTER(Ref)
+OSStatus = ctypes.c_int32
+READ_PROC = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+NOTIFY_PROC = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+
 for _fn, _res, _args in [
     ("MIDIGetNumberOfSources", ctypes.c_ulong, []),
-    ("MIDIGetSource", ctypes.c_void_p, [ctypes.c_ulong]),
+    ("MIDIGetSource", Ref, [ctypes.c_ulong]),
     ("MIDIGetNumberOfDestinations", ctypes.c_ulong, []),
-    ("MIDIGetDestination", ctypes.c_void_p, [ctypes.c_ulong]),
+    ("MIDIGetDestination", Ref, [ctypes.c_ulong]),
+    ("MIDIObjectGetStringProperty", OSStatus,
+     [Ref, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]),
+    ("MIDIClientCreate", OSStatus,
+     [ctypes.c_void_p, NOTIFY_PROC, ctypes.c_void_p, RefP]),
+    ("MIDIInputPortCreate", OSStatus,
+     [Ref, ctypes.c_void_p, READ_PROC, ctypes.c_void_p, RefP]),
+    ("MIDIOutputPortCreate", OSStatus, [Ref, ctypes.c_void_p, RefP]),
+    ("MIDIPortConnectSource", OSStatus, [Ref, Ref, ctypes.c_void_p]),
+    ("MIDISend", OSStatus, [Ref, Ref, ctypes.c_void_p]),
+    ("MIDIClientDispose", OSStatus, [Ref]),
 ]:
     getattr(_cm, _fn).restype = _res
     getattr(_cm, _fn).argtypes = _args
 
-_cm.MIDIObjectGetStringProperty.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
 _kName = ctypes.c_void_p.in_dll(_cm, "kMIDIPropertyName")
-
-READ_PROC = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
 
 
 def _cfstr(s):
     return _cf.CFStringCreateWithCString(None, s.encode(), UTF8)
 
 
-def _obj_name(obj):
+def _obj_name(ref):
     s = ctypes.c_void_p()
-    if _cm.MIDIObjectGetStringProperty(obj, _kName, ctypes.byref(s)) != 0:
+    if _cm.MIDIObjectGetStringProperty(ref, _kName, ctypes.byref(s)) != 0:
         return "?"
     buf = ctypes.create_string_buffer(256)
     _cf.CFStringGetCString(s.value, buf, 256, UTF8)
@@ -200,9 +216,12 @@ def find_endpoint(kind):
         f"direct USB port on the Mac.")
 
 
+_NULL_NOTIFY = ctypes.cast(None, NOTIFY_PROC)
+
+
 def _client(name="midimix.py"):
-    ref = ctypes.c_void_p()
-    err = _cm.MIDIClientCreate(_cfstr(name), None, None, ctypes.byref(ref))
+    ref = Ref()
+    err = _cm.MIDIClientCreate(_cfstr(name), _NULL_NOTIFY, None, ctypes.byref(ref))
     if err:
         raise SystemExit(f"MIDIClientCreate failed: {err}")
     return ref
@@ -235,9 +254,10 @@ def _packet_list(msg):
 
 def send_raw(msg, quiet=False):
     dest = find_endpoint("dest")
-    port = ctypes.c_void_p()
-    if _cm.MIDIOutputPortCreate(_client(), _cfstr("out"), ctypes.byref(port)):
-        raise SystemExit("MIDIOutputPortCreate failed")
+    port = Ref()
+    err = _cm.MIDIOutputPortCreate(_client(), _cfstr("out"), ctypes.byref(port))
+    if err:
+        raise SystemExit(f"MIDIOutputPortCreate failed: {err}")
     err = _cm.MIDISend(port, dest, _packet_list(msg))
     if err:
         raise SystemExit(f"MIDISend failed: {err}")
@@ -256,17 +276,38 @@ def _listen(callback):
                 callback(msg)
 
     proc = READ_PROC(on_read)
-    port = ctypes.c_void_p()
-    if _cm.MIDIInputPortCreate(client, _cfstr("in"), proc, None, ctypes.byref(port)):
-        raise SystemExit("MIDIInputPortCreate failed")
-    if _cm.MIDIPortConnectSource(port, src, None):
-        raise SystemExit("MIDIPortConnectSource failed")
-    return client, port, proc  # caller must keep these alive
+    port = Ref()
+    err = _cm.MIDIInputPortCreate(client, _cfstr("in"), proc, None, ctypes.byref(port))
+    if err:
+        raise SystemExit(f"MIDIInputPortCreate failed: {err}")
+    err = _cm.MIDIPortConnectSource(port, src, None)
+    if err:
+        raise SystemExit(f"MIDIPortConnectSource failed: {err}")
+    return client, port, proc  # caller must keep these alive (esp. `proc`)
 
 
 def _pump(seconds):
     mode = ctypes.c_void_p.in_dll(_cf, "kCFRunLoopDefaultMode")
     _cf.CFRunLoopRunInMode(mode, seconds, False)
+
+
+def _run_until_interrupt(deadline=None):
+    """Pump the run loop until Ctrl-C, or until `deadline` (a monotonic time).
+
+    A plain `except KeyboardInterrupt` is not enough here: CFRunLoopRunInMode is
+    a blocking C call, and SIGINT delivered while inside it does not reliably
+    surface as a Python exception. An explicit handler flipping a flag does.
+    """
+    import signal
+    stop = []
+    prev = signal.signal(signal.SIGINT, lambda *_: stop.append(True))
+    try:
+        while not stop:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            _pump(0.2)
+    finally:
+        signal.signal(signal.SIGINT, prev)
 
 
 # --------------------------------------------------------------------------
@@ -293,7 +334,7 @@ def describe(msg, labels):
     return f"raw     {msg.hex(' ')}"
 
 
-def cmd_mon(preset=None):
+def cmd_mon(preset=None, seconds=None):
     labels = control_map(*parse_preset(preset)) if preset else {}
     if preset:
         print(f"labels from {os.path.basename(preset)} ({len(labels)} controls)")
@@ -312,7 +353,7 @@ def cmd_mon(preset=None):
             print(("\n" if state["last"] else "") + line, end="", flush=True)
         state["last"] = key
 
-    refs = _listen(on_msg)  # noqa: F841 -- keep alive
+    client, _port, _proc = _listen(on_msg)  # _proc must stay referenced
 
     print(f"\nListening on {DEVICE_NAME}. Ctrl-C to stop.\n")
     print("Work through it deliberately:")
@@ -323,21 +364,37 @@ def cmd_mon(preset=None):
     print("  5. SEND ALL, then BANK LEFT, then BANK RIGHT")
     print(f"\n{DIM}Anything flagged NOT IN PRESET is a control the preset does not")
     print(f"describe -- that is how we identify the four fixed buttons.{RST}\n")
-    try:
-        while True:
-            _pump(0.2)
-    except KeyboardInterrupt:
-        pass
 
-    print(f"\n\n--- summary: {len(state['seen'])} distinct controls seen ---")
+    deadline = time.monotonic() + float(seconds) if seconds else None
+    _run_until_interrupt(deadline)
+    _cm.MIDIClientDispose(client)   # CoreMIDI's thread otherwise outlives main()
+
+    n = len(state["seen"])
+    print(f"\n\n--- summary: {n} distinct controls seen ---")
+
+    if n == 0:
+        print(f"{YEL}No MIDI received at all.{RST} That is not a verdict about the")
+        print("buttons -- nothing was heard from any control. Either nothing was")
+        print("touched, or the device is not transmitting. Check:")
+        print("  - is it the MIDI Mix you moved, and is it still plugged in?")
+        print("  - `python3 tools/midimix.py ports` should list it")
+        print("  - the manual requires a POWERED hub; try a direct USB port")
+        return
+
     if state["unknown"]:
-        print("messages NOT described by the preset:")
+        print("messages NOT described by the preset (i.e. the fixed buttons):")
         for (ch, cc), val in sorted(state["unknown"].items()):
             print(f"  ch{ch + 1:<2} CC{cc:<3} (last val {val})")
+        print("=> these are mappable in Logic like any other control.")
+    elif n >= 50:
+        print("Every message matched the preset, across a full sweep of the panel.")
+        print("=> SEND ALL / BANK LEFT / BANK RIGHT transmit nothing of their own;")
+        print("   they are handled internally by the firmware and cannot be mapped")
+        print("   in Logic. Use a Logic key command for track banking.")
     else:
-        print("every message matched the preset; the fixed buttons sent nothing.")
-        print("=> BANK L/R and SEND ALL are handled internally by the firmware")
-        print("   and cannot be mapped in Logic. Use a key command for banking.")
+        print("Every message matched the preset, but only part of the panel was")
+        print(f"covered ({n} of 57 controls). Re-run and work through all five")
+        print("steps before drawing conclusions about the fixed buttons.")
 
 
 # --------------------------------------------------------------------------
@@ -402,7 +459,7 @@ def cmd_ports():
 
 def main(argv):
     cmds = {
-        "show": (cmd_show, 1, 1), "mon": (cmd_mon, 0, 1), "send": (cmd_send, 1, 1),
+        "show": (cmd_show, 1, 1), "mon": (cmd_mon, 0, 2), "send": (cmd_send, 1, 1),
         "dump": (cmd_dump, 0, 1), "diff": (cmd_diff, 2, 2), "ports": (cmd_ports, 0, 0),
     }
     if len(argv) < 2 or argv[1] not in cmds:
