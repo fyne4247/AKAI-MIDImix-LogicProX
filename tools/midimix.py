@@ -3,7 +3,8 @@
 
 Subcommands:
     show <preset.midimix>       decode a preset to a readable table
-    mon  [preset.midimix] [secs] live-monitor the device, labelled via a preset
+    mon  [preset] [secs] [--quiet] [--out PATH]
+                                live-monitor; writes a summary to output.md
     send <preset.midimix>       flash a preset to the device
     dump [out.midimix]          ask the device for its current config
 
@@ -368,67 +369,159 @@ def describe(msg, labels):
     return f"raw     {msg.hex(' ')}"
 
 
-def cmd_mon(preset=None, seconds=None):
+def cmd_mon(*args):
+    """mon [preset] [seconds] [--quiet] [--out PATH]
+
+    Writes a compact summary to output.md rather than relying on the scrollback:
+    a full panel sweep is thousands of messages and unusable as raw text.
+    """
+    quiet = "--quiet" in args
+    args = [a for a in args if a != "--quiet"]
+    out_path = "output.md"
+    if "--out" in args:
+        i = args.index("--out")
+        out_path = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    preset = next((a for a in args if not a.replace(".", "").isdigit()), None)
+    seconds = next((a for a in args if a.replace(".", "").isdigit()), None)
+
     labels = control_map(*parse_preset(preset)) if preset else {}
     if preset:
         print(f"labels from {os.path.basename(preset)} ({len(labels)} controls)")
 
-    state = {"last": None, "seen": set(), "unknown": {}}
+    # per-address stats rather than a per-message log
+    stats = {}          # (ch, cc) -> {"n":count, "lo":min, "hi":max, "note":bool}
+    state = {"last": None, "total": 0}
 
     def on_msg(msg):
-        line = describe(msg, labels)
-        key = msg[:2]
-        state["seen"].add(key)
-        if msg[0] & 0xF0 == 0xB0 and (msg[0] & 0x0F, msg[1]) not in labels:
-            state["unknown"][(msg[0] & 0x0F, msg[1])] = msg[2]
-        if state["last"] == key:
-            print("\r" + line, end="", flush=True)   # collapse a fader sweep
-        else:
-            print(("\n" if state["last"] else "") + line, end="", flush=True)
+        st = msg[0]
+        kind, ch = st & 0xF0, st & 0x0F
+        if kind not in (0xB0, 0x90, 0x80) or len(msg) < 3:
+            return
+        key = (ch, msg[1])
+        s = stats.setdefault(key, {"n": 0, "lo": 127, "hi": 0, "note": kind != 0xB0})
+        s["n"] += 1
+        s["lo"] = min(s["lo"], msg[2])
+        s["hi"] = max(s["hi"], msg[2])
+        state["total"] += 1
+        if not quiet and state["last"] != key:
+            label = labels.get(key) or f"{YEL}NOT IN PRESET{RST}"
+            print(f"  [{len(stats):2}/57] ch{ch + 1:<2} CC{msg[1]:<3}  {label}", flush=True)
         state["last"] = key
 
     client, _port, _proc = _listen(on_msg)  # _proc must stay referenced
 
-    print(f"\nListening on {DEVICE_NAME}. Ctrl-C to stop.\n")
-    print("Work through it deliberately:")
-    print("  1. every knob, top row left to right, then middle, then bottom")
-    print("  2. every fader including MASTER")
+    print(f"\nListening on {DEVICE_NAME}. Ctrl-C when done.\n")
+    print("Work through the panel deliberately:")
+    print("  1. every knob  - top row left to right, then middle, then bottom")
+    print("  2. every fader, including MASTER")
     print("  3. every MUTE, then every REC ARM")
-    print("  4. HOLD SOLO and press each MUTE  -> should be a third CC range")
+    print("  4. HOLD SOLO and press each MUTE   <- the shifted layer")
     print("  5. SEND ALL, then BANK LEFT, then BANK RIGHT")
-    print(f"\n{DIM}Anything flagged NOT IN PRESET is a control the preset does not")
-    print(f"describe -- that is how we identify the four fixed buttons.{RST}\n")
+    print(f"\n{DIM}One line per NEW control, not per message. A running count is")
+    print(f"shown so you can tell when all 57 are covered.{RST}\n")
 
+    started = time.time()
     deadline = time.monotonic() + float(seconds) if seconds else None
     _run_until_interrupt(deadline)
     _cm.MIDIClientDispose(client)   # CoreMIDI's thread otherwise outlives main()
 
-    n = len(state["seen"])
-    print(f"\n\n--- summary: {n} distinct controls seen ---")
+    _write_summary(out_path, preset, labels, stats, state["total"],
+                   int(time.time() - started))
 
-    if n == 0:
-        print(f"{YEL}No MIDI received at all.{RST} That is not a verdict about the")
-        print("buttons -- nothing was heard from any control. Either nothing was")
-        print("touched, or the device is not transmitting. Check:")
-        print("  - is it the MIDI Mix you moved, and is it still plugged in?")
-        print("  - `python3 tools/midimix.py ports` should list it")
-        print("  - the manual requires a POWERED hub; try a direct USB port")
-        return
 
-    if state["unknown"]:
-        print("messages NOT described by the preset (i.e. the fixed buttons):")
-        for (ch, cc), val in sorted(state["unknown"].items()):
-            print(f"  ch{ch + 1:<2} CC{cc:<3} (last val {val})")
-        print("=> these are mappable in Logic like any other control.")
-    elif n >= 50:
-        print("Every message matched the preset, across a full sweep of the panel.")
-        print("=> SEND ALL / BANK LEFT / BANK RIGHT transmit nothing of their own;")
-        print("   they are handled internally by the firmware and cannot be mapped")
-        print("   in Logic. Use a Logic key command for track banking.")
+def _write_summary(path, preset, labels, stats, total, elapsed):
+    seen = set(stats)
+    known = {k: v for k, v in stats.items() if k in labels}
+    unknown = {k: v for k, v in stats.items() if k not in labels}
+    missing = sorted(set(labels) - seen)
+
+    L = []
+    L.append("# MIDI Mix capture")
+    L.append("")
+    L.append(f"- captured: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    L.append(f"- preset: `{os.path.basename(preset) if preset else '(none)'}`")
+    L.append(f"- duration: {elapsed}s, {total} messages")
+    L.append(f"- distinct controls seen: **{len(seen)}**"
+             + (f" of {len(labels)} in the preset" if labels else ""))
+    L.append("")
+
+    if not seen:
+        L.append("## Nothing was received")
+        L.append("")
+        L.append("No MIDI arrived at all. This is **not** a verdict about the fixed")
+        L.append("buttons -- nothing was heard from any control. Check:")
+        L.append("")
+        L.append("- was it the MIDI Mix that was moved, and is it still plugged in?")
+        L.append("- `python3 tools/midimix.py ports` should list it")
+        L.append("- if the monitor previously crashed, the parser fix may still be wrong")
     else:
-        print("Every message matched the preset, but only part of the panel was")
-        print(f"covered ({n} of 57 controls). Re-run and work through all five")
-        print("steps before drawing conclusions about the fixed buttons.")
+        if unknown:
+            L.append("## NOT in the preset")
+            L.append("")
+            L.append("These are the firmware-fixed buttons (SEND ALL / BANK LEFT /")
+            L.append("BANK RIGHT / SOLO). **They transmit, so they are mappable.**")
+            L.append("")
+            L.append("| Address | Type | Values | Msgs |")
+            L.append("|---|---|---|---|")
+            for (ch, cc), s in sorted(unknown.items()):
+                kind = "Note" if s["note"] else "CC"
+                L.append(f"| ch{ch + 1} {kind}{cc} | {kind} | {s['lo']}–{s['hi']} | {s['n']} |")
+            L.append("")
+            L.append("**=> Banking is achievable.** Map BANK LEFT/RIGHT to MCU notes")
+            L.append("46/47 (translator route) or to track banking in Controller")
+            L.append("Assignments.")
+        else:
+            L.append("## NOT in the preset")
+            L.append("")
+            if len(seen) >= 50:
+                L.append("Nothing. Across a full sweep, every message matched the preset.")
+                L.append("")
+                L.append("**=> SEND ALL / BANK LEFT / BANK RIGHT transmit nothing of their")
+                L.append("own** — they are handled internally by the firmware and cannot")
+                L.append("be mapped. Use a Logic key command for banking, or repurpose")
+                L.append("two spare buttons.")
+            else:
+                L.append(f"Nothing — but only {len(seen)} of 57 controls were covered, so")
+                L.append("this is **not conclusive**. Re-run and work through all five")
+                L.append("steps before deciding about the fixed buttons.")
+        L.append("")
+
+        if missing:
+            L.append(f"## Preset controls never seen ({len(missing)})")
+            L.append("")
+            L.append("Either not touched, or not transmitting. If you are sure you moved")
+            L.append("one of these, that control or the preset is wrong.")
+            L.append("")
+            for ch, cc in missing:
+                L.append(f"- ch{ch + 1} CC{cc} — {labels[(ch, cc)]}")
+            L.append("")
+
+        L.append(f"## Matched the preset ({len(known)})")
+        L.append("")
+        L.append("| Control | Address | Values | Msgs |")
+        L.append("|---|---|---|---|")
+        for (ch, cc), s in sorted(known.items(), key=lambda kv: labels[kv[0]]):
+            L.append(f"| {labels[(ch, cc)]} | ch{ch + 1} CC{cc} | "
+                     f"{s['lo']}–{s['hi']} | {s['n']} |")
+        L.append("")
+        notes = [k for k, v in stats.items() if v["note"]]
+        if notes:
+            L.append(f"> {len(notes)} address(es) arrived as **Note** messages rather "
+                     f"than CC.")
+
+    with open(path, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+
+    print(f"\n\n--- {len(seen)} distinct controls, {total} messages ---")
+    print(f"summary written to {path}")
+    if unknown:
+        print(f"{len(unknown)} address(es) NOT in the preset -> the fixed buttons "
+              f"DO transmit")
+    elif len(seen) >= 50:
+        print("nothing outside the preset -> the fixed buttons transmit nothing")
+    elif seen:
+        print(f"only {len(seen)}/57 controls covered -- not conclusive, re-run")
 
 
 # --------------------------------------------------------------------------
@@ -493,7 +586,7 @@ def cmd_ports():
 
 def main(argv):
     cmds = {
-        "show": (cmd_show, 1, 1), "mon": (cmd_mon, 0, 2), "send": (cmd_send, 1, 1),
+        "show": (cmd_show, 1, 1), "mon": (cmd_mon, 0, 6), "send": (cmd_send, 1, 1),
         "dump": (cmd_dump, 0, 1), "diff": (cmd_diff, 2, 2), "ports": (cmd_ports, 0, 0),
     }
     if len(argv) < 2 or argv[1] not in cmds:

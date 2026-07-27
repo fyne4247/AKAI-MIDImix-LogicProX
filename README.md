@@ -87,7 +87,7 @@ Apple is winding down. It is kept in the repo as a reference fallback only.
 python3 tools/midimix.py ports              # list CoreMIDI endpoints
 python3 tools/midimix.py show <preset>      # decode a preset to a table
 python3 tools/midimix.py diff <a> <b>       # check two presets for collisions
-python3 tools/midimix.py mon [preset]       # live monitor, labelled by preset
+python3 tools/midimix.py mon [preset]       # live monitor -> writes output.md
 python3 tools/midimix.py send <preset>      # flash a preset
 python3 tools/midimix.py dump [out]         # request device config (see below)
 python3 tools/make_logic_preset.py          # regenerate logic-mode.midimix
