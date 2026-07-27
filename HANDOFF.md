@@ -110,24 +110,31 @@ SOLO-shifted MUTE layer. **Now confirmed on the wire.**
 Measurement: a 70-second full-panel sweep, 1101 messages, produced hits on exactly the
 57 preset addresses and **nothing outside them**.
 
-- **BANK LEFT / BANK RIGHT transmit nothing.** The channel shift is entirely internal to
-  the firmware. They **cannot be mapped** — not in Logic, not by a translator. Banking
-  must come from a Logic key command or from repurposing two spare buttons. This closes
-  the project's most important open question.
-- **SEND ALL** transmits no message of its own; it retransmits every control's current
-  position, exactly as the manual describes. Observed working.
-- **SOLO is a toggle on this unit, not a press-and-hold.** The manual says hold; the
-  hardware disagrees. Press once to arm the shifted layer, again to leave it. The shifted
-  MUTE row transmits its own CC block either way.
+- **BANK LEFT / BANK RIGHT — contradictory results.** First measurement (70s sweep,
+  1101 messages) found nothing outside the 57 preset addresses — concluded they transmit
+  nothing. Second measurement (2026-07-27, later run) showed BANK LEFT producing
+  ch1 CC25 and BANK RIGHT producing ch1 CC26. Those are **knob row3 strip5 / strip6
+  addresses in the mGB preset**, so either (a) the bank buttons share addressing with
+  those knobs, or (b) they were accidentally bumped. **Not settled — needs a focused
+  retest with hands off the knobs.** If they do transmit on those CCs, they are
+  mappable after all but will collide with the knobs unless the logic-mode preset
+  moves them apart.
+- **SEND ALL** retransmits control positions. Second run showed it sending the first
+  5 controls with non-zero positions (knob row1 strips 1/3/5/7 and fader MASTER).
+  No message of its own — exactly as the manual describes.
+- **SOLO behaviour is inconsistent across runs.** First run: toggle (press once to arm,
+  again to leave). Second run: hold, matching the manual. The firmware may have two
+  modes, or the state may depend on power-cycle / bank state. Releasing SOLO on the
+  second run also produced a ch1 CC27 (knob row3 strip7) message — possibly a
+  physical bump, possibly firmware. **Not settled.**
 - **Button press behaviour is mixed** — some momentary (127 on press, 0 on release),
   some toggling (127, then 0 on the next press). Indistinguishable on the wire: a
   receiver sees only a CC going to 127 and later to 0.
-- **The LEDs do not light.** The manual documents no LED behaviour whatsoever. Untested
-  hypothesis: the lamps are host-driven and need the button's CC echoed back to the
-  device. `python3 tools/midimix.py led` walks each row to settle it. **If they need an
-  echo, Logic's Controller Assignments cannot supply one** — that route leaves the panel
-  dark, and only the translator daemon could light it. This is now a real argument for
-  the translator, independent of the fader-behaviour argument.
+- **The LEDs do not respond to MIDI feedback — confirmed.** Tested with working
+  output (the outbound pack(4) fix verified by selftest round-trip). Neither CC
+  nor Note On messages on any channel light any lamp. The LEDs are firmware-internal
+  only. Neither Controller Assignments nor a translator daemon can light them.
+  This removes LED feedback as an argument for the translator route.
 
 ## 4. What is already built
 
@@ -233,7 +240,7 @@ To re-run at any point:
 python3 tools/midimix.py mon presets/mgb-mode.midimix
 ```
 
-Still worth doing once: `python3 tools/midimix.py led` — see §3.5.
+LED test completed — LEDs do not respond to host MIDI. See §3.5.
 
 **The `pack(4)` trap bit twice.** The inbound fix (§ the `MIDIPacketList` note) was only
 half of it: `_packet_list`, used for *every* outgoing message, was still built at natural
@@ -314,8 +321,9 @@ Resolved since the first draft: BANK LEFT/RIGHT **do not transmit** (§3.5); the
 
 Still open:
 
-1. **Do the button LEDs accept MIDI feedback?** Run `tools/midimix.py led`. Decides
-   whether the panel can ever show state, and is now an argument for the translator.
+1. ~~Do the button LEDs accept MIDI feedback?~~ **Resolved: no.** Tested with
+   confirmed-working output. LEDs are firmware-internal only. This is no longer
+   an argument for or against any route.
 2. **The Mackie handshake.** The single biggest project risk. §6 Phase 1.
 3. **What the button `type` byte means.** Both stock presets use `1`. Observed press
    behaviour is mixed, so `type` is probably not the only factor. Low priority — it does

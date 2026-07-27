@@ -184,18 +184,20 @@ After a mapping session: quit Logic (it flushes the `.cs` on exit), then re-copy
 - **SEND ALL** retransmits every control's current position, so software can sync to the
   physical positions. The manual notes it may do nothing if the software uses pickup or
   takeover mode.
-- **BANK LEFT / RIGHT transmit nothing.** Measured: a 70-second full-panel sweep
-  produced 1101 messages across exactly the 57 preset addresses and **nothing else**.
-  The manual says they "shift the 8 channels controlled by MIDImix"; that shift is
-  handled entirely inside the firmware. They cannot be mapped. Use a Logic key
-  command for banking, or repurpose two spare buttons.
-- **SOLO is a toggle on this unit, not a hold.** The manual says "press and hold";
-  the hardware disagrees. Press it once to arm the shifted layer, again to leave.
-  The shifted MUTE row (CC41–48 in mgb-mode) transmits either way.
+- **BANK LEFT / RIGHT — not settled.** First run (70s sweep, 1101 messages) found
+  nothing outside the 57 preset addresses. Second run saw ch1 CC25 from BANK LEFT
+  and ch1 CC26 from BANK RIGHT — but those are knob row3 strip5/6 addresses, so
+  a physical bump cannot be ruled out. Needs a focused retest with hands off the
+  knobs.
+- **SOLO behaviour is inconsistent.** First run: toggle (press to arm, press to
+  leave). Second run: hold, matching the manual. May depend on power-cycle or
+  bank state.
 - **Button behaviour is mixed** — some send 127-on-press / 0-on-release (momentary),
   others alternate 127 / 0 across presses (toggle). Both look identical on the wire,
   so Logic sees only "a CC that goes to 127 and later to 0".
-- **The LEDs do not self-light.** Undocumented — the manual has no LED section.
-  Run `python3 tools/midimix.py led` to test whether they respond to MIDI echoed
-  back to the device. This matters: if they need an echo, Logic's Controller
-  Assignments cannot provide one and the lamps will stay dark on that route.
+- **The LEDs do not respond to MIDI feedback.** Tested twice: once with broken
+  output (void result), once with confirmed-working output (real result). Neither
+  CC nor Note On messages on any channel light any lamp. The LEDs appear to be
+  firmware-internal only — they reflect the device's own state, not host state.
+  This means neither Controller Assignments nor a translator daemon can light
+  the panel; the lamps will always show whatever the firmware decides.
