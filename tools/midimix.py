@@ -280,11 +280,20 @@ def _iter_packets(pkt_list_ptr):
 
 
 def _packet_list(msg):
-    buf = ctypes.create_string_buffer(8 + 10 + len(msg))
-    ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint32))[0] = 1                     # numPackets
-    ctypes.cast(ctypes.byref(buf, 8), ctypes.POINTER(ctypes.c_uint64))[0] = 0    # timeStamp
-    ctypes.cast(ctypes.byref(buf, 16), ctypes.POINTER(ctypes.c_uint16))[0] = len(msg)
-    ctypes.memmove(ctypes.byref(buf, 18), msg, len(msg))
+    """Build a one-packet MIDIPacketList for MIDISend.
+
+    Same pack(4) trap as _iter_packets, in the outgoing direction. Natural
+    alignment would put timeStamp at 8 and length at 16, but arm64 CoreMIDI
+    wraps the structs in `#pragma pack(4)`, so packet[0] starts at offset 4:
+    timeStamp at 4, length at 12, data at 14. Building it the natural way makes
+    CoreMIDI read the length out of the zero half of the timestamp, so it sends
+    a zero-length packet -- no error, no data. Every send silently did nothing.
+    """
+    buf = ctypes.create_string_buffer(4 + 8 + 2 + len(msg))
+    ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint32))[0] = 1                    # numPackets
+    ctypes.cast(ctypes.byref(buf, 4), ctypes.POINTER(ctypes.c_uint64))[0] = 0   # timeStamp
+    ctypes.cast(ctypes.byref(buf, 12), ctypes.POINTER(ctypes.c_uint16))[0] = len(msg)
+    ctypes.memmove(ctypes.byref(buf, 14), msg, len(msg))
     return buf
 
 

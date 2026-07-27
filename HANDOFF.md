@@ -235,6 +235,15 @@ python3 tools/midimix.py mon presets/mgb-mode.midimix
 
 Still worth doing once: `python3 tools/midimix.py led` — see §3.5.
 
+**The `pack(4)` trap bit twice.** The inbound fix (§ the `MIDIPacketList` note) was only
+half of it: `_packet_list`, used for *every* outgoing message, was still built at natural
+alignment. CoreMIDI read the packet length out of the zero half of the timestamp, so it
+sent a zero-length packet — no error code, no data. **Every `send` and every LED message
+this tool ever issued was silently empty**, which is why the first LED test showed
+nothing. Fixed, and `selftest.py` now round-trips `_packet_list` output back through
+`_iter_packets` — the reader that hardware has already validated. If you touch either
+function, keep that check.
+
 ### Phase 1 — prove Logic accepts a virtual surface (the make-or-break step)
 Create a virtual CoreMIDI source+destination pair named something Logic-friendly. In
 Logic: Setup → Control Surfaces → Install → **Mackie Designs / Mackie Control** → Add,

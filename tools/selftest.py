@@ -98,6 +98,16 @@ def main():
                 + struct.pack("<H", 3) + bytes([0x00, 0x00, 0x00]) + bytes(64)) == [])
     check("null pointer refused", list(M._iter_packets(0)) == [])
 
+    print("\noutput packets are built at the same pack(4) offsets")
+    # _packet_list once built at natural alignment, so CoreMIDI read the length
+    # out of the zero half of the timestamp and sent a zero-length packet: no
+    # error, no data. Every flash and every LED message silently did nothing.
+    import ctypes as _c
+    for m in MESSAGES:
+        buf = M._packet_list(m)
+        got = list(M._iter_packets(_c.addressof(buf)))
+        check(f"_packet_list round-trips {m.hex(' ')}", got == [m], f"got {got}")
+
     print("\nmessage decoding")
     check("CC decodes with channel and value",
           "ch4" in M.describe(bytes([0xB3, 0x16, 0x00]), {})

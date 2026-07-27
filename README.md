@@ -114,6 +114,12 @@ length, and walks off the end of the buffer. The parser now probes both layouts,
 validates that each packet starts with a real status byte, and bounds every read,
 so malformed input yields nothing instead of killing the process.
 
+The **same trap applies to outgoing messages**, and bit a second time.
+`_packet_list` was built at natural alignment long after the reader was fixed, so
+CoreMIDI took the length from the zero half of the timestamp and sent a zero-length
+packet — no error, no data. Every flash and every LED message silently did nothing.
+`selftest.py` now round-trips built packets back through the reader.
+
 Two other traps in the ctypes bindings, both fatal and both silent:
 
 - **Every function needs `argtypes`.** Without them ctypes passes 64-bit
