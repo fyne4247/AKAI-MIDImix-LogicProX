@@ -91,7 +91,35 @@ python3 tools/midimix.py mon [preset]       # live monitor, labelled by preset
 python3 tools/midimix.py send <preset>      # flash a preset
 python3 tools/midimix.py dump [out]         # request device config (see below)
 python3 tools/make_logic_preset.py          # regenerate logic-mode.midimix
+python3 tools/selftest.py                   # parser + preset round-trip tests
 ```
+
+### A note on `MIDIPacketList`
+
+The first version of the monitor crashed with a **bus error**. CoreMIDI declares
+
+```c
+struct MIDIPacket     { MIDITimeStamp timeStamp; UInt16 length; Byte data[256]; };
+struct MIDIPacketList { UInt32 numPackets; MIDIPacket packet[1]; };
+```
+
+Natural alignment puts `packet[0]` at offset 8, because `MIDITimeStamp` is 64-bit
+— but on arm64 CoreMIDI wraps both structs in `#pragma pack(4)`, so it actually
+begins at offset **4**. Reading at 8 lands inside the timestamp, produces a garbage
+length, and walks off the end of the buffer. The parser now probes both layouts,
+validates that each packet starts with a real status byte, and bounds every read,
+so malformed input yields nothing instead of killing the process.
+
+Two other traps in the ctypes bindings, both fatal and both silent:
+
+- **Every function needs `argtypes`.** Without them ctypes passes 64-bit
+  `CFStringRef` pointers as 32-bit ints, truncating them.
+- **`MIDIObjectRef` and friends are `UInt32` typedefs, not pointers.**
+
+`tools/selftest.py` covers the parsing deterministically. It does not exercise
+Apple's own struct construction: CoreMIDI will not deliver a virtual endpoint's
+traffic back to the client that created it, and cross-process virtual endpoints
+did not deliver here either. The real device is the final check.
 
 `dump` sends opcode `0x66`, a guess at the read pairing for the confirmed `0x67`
 write. If the device doesn't answer, nothing is harmed — an unrecognised SysEx is

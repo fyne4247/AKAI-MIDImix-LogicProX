@@ -227,20 +227,54 @@ def _client(name="midimix.py"):
     return ref
 
 
-# MIDIPacketList on arm64: numPackets (u32) + 4 bytes padding, packets from
-# offset 8. Each packet: timeStamp (u64), length (u16), data[length]. The
-# MIDIPacketNext macro 4-byte-aligns successive packets on ARM.
+# MIDIPacketList layout is platform-dependent and getting it wrong is fatal.
+#
+#   struct MIDIPacket     { MIDITimeStamp timeStamp; UInt16 length; Byte data[256]; };
+#   struct MIDIPacketList { UInt32 numPackets; MIDIPacket packet[1]; };
+#
+# On arm64 CoreMIDI wraps these in `#pragma pack(4)`, so packet[0] begins at
+# offset 4 and successive packets are 4-byte aligned. Without the packing (the
+# Intel case) the 8-byte alignment of MIDITimeStamp pushes packet[0] to offset
+# 8. Reading at the wrong offset lands inside the timestamp, yields a garbage
+# length, and walks off the end of the buffer -- a bus error, not an exception.
+#
+# Rather than trust a hardcoded guess, probe both layouts and keep the one that
+# validates: a MIDI packet always starts with a status byte (>= 0x80) and its
+# length is 1..256.
+_MAX_PACKET = 256
+_CANDIDATE_OFFSETS = (4, 8)
+
+
+def _valid_at(base, off):
+    length = ctypes.cast(ctypes.byref(base.contents, off + 8),
+                         ctypes.POINTER(ctypes.c_uint16))[0]
+    if not 1 <= length <= _MAX_PACKET:
+        return False
+    return base[off + 10] >= 0x80        # first data byte must be a status byte
+
+
 def _iter_packets(pkt_list_ptr):
+    if not pkt_list_ptr:
+        return
     base = ctypes.cast(pkt_list_ptr, ctypes.POINTER(ctypes.c_ubyte))
     num = ctypes.cast(pkt_list_ptr, ctypes.POINTER(ctypes.c_uint32))[0]
-    off = 8
-    for _ in range(min(num, 64)):
+    if not 1 <= num <= 256:              # implausible count => refuse to parse
+        return
+
+    start = next((o for o in _CANDIDATE_OFFSETS if _valid_at(base, o)), None)
+    if start is None:
+        return
+
+    off = start
+    for _ in range(num):
         length = ctypes.cast(ctypes.byref(base.contents, off + 8),
                              ctypes.POINTER(ctypes.c_uint16))[0]
-        if not 0 < length <= 65535:
-            return
+        if not 1 <= length <= _MAX_PACKET:
+            return                       # corrupt: stop rather than read on
         yield bytes(base[off + 10: off + 10 + length])
         off = (off + 10 + length + 3) & ~3
+        if off > 65536:                  # hard bound; a list is never this big
+            return
 
 
 def _packet_list(msg):
