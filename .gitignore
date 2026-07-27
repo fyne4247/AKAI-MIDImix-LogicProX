@@ -2,3 +2,12 @@
 __pycache__/
 *.pyc
 output.md
+
+# runtime (virtual MCU probe)
+.mcu_surface.pid
+.mcu_cmd
+
+# local IDE / agent
+.claude/
+.DS_Store
+....

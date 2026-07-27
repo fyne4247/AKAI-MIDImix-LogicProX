@@ -7,7 +7,7 @@ Subcommands:
                                 live-monitor; writes a summary to output.md
     send <preset.midimix>       flash a preset to the device
     dump [out.midimix]          ask the device for its current config
-    led  [preset]               test whether the button LEDs accept feedback
+    led  [preset] [--scan|--notes]  LED tests → output/led-scan-latest.md or led-notes-latest.md
 
 Preset format (reverse-engineered, verified against two independent presets):
 
@@ -567,48 +567,319 @@ def cmd_send(path):
     print("done. Run `mon` to confirm the device now reports these channels.")
 
 
-def cmd_led(preset=None):
-    """led [preset] -- walk the button LEDs to see whether the device accepts
-    LED feedback over MIDI.
+def cmd_led(*args):
+    """led [preset] [--scan | --notes]
 
-    The MIDI Mix manual documents no LED behaviour at all. The open question is
-    whether the lamps are driven by the firmware on press (self-lighting) or by
-    the host echoing the button's own CC back to the device. If it is the
-    latter, Logic will never light them on its own and the translator has to do
-    it -- which is the whole point of testing this before building anything.
+    --scan (default): coarse A–G multi-message blasts that light the panel;
+      freeform note after each ON → output/led-scan-latest.md
+
+    --notes: one Note On at a time, ch1 notes 0..23 (the range that worked
+      in scan B/C/D); freeform note after each → output/led-notes-latest.md
     """
-    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = preset or os.path.join(_root, "presets", "mgb-mode.midimix")
-    knobs, faders, buttons = parse_preset(path)
-    print(f"using {os.path.basename(path)}")
-    print("\nWatch the button LEDs. Each row lights for 1.5s, then clears.\n")
+    args = list(args)
+    mode = "scan"
+    if "--notes" in args:
+        mode = "notes"
+        args = [a for a in args if a != "--notes"]
+    if "--scan" in args:
+        mode = "scan"
+        args = [a for a in args if a != "--scan"]
+    if "--map" in args:
+        mode = "notes"  # old alias → fine note map
+        args = [a for a in args if a != "--map"]
 
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = args[0] if args else os.path.join(_root, "presets", "mgb-mode.midimix")
+    _knobs, _faders, buttons = parse_preset(path)
+
+    if mode == "notes":
+        return _cmd_led_notes(path, buttons, _root)
+    return _cmd_led_scan(path, buttons, _root)
+
+
+def _led_open_port():
     dest = find_endpoint("dest")
     port = Ref()
-    if _cm.MIDIOutputPortCreate(_client(), _cfstr("led"), ctypes.byref(port)):
+    client = _client("led-test")
+    if _cm.MIDIOutputPortCreate(client, _cfstr("led"), ctypes.byref(port)):
         raise SystemExit("MIDIOutputPortCreate failed")
+    return client, port, dest
 
-    def blast(rows, value):
-        for row in rows:
-            for ch, _t, cc in buttons[row * 8:row * 8 + 8]:
-                for status in (0xB0 | ch, 0x90 | ch):   # try CC, then Note On
-                    _cm.MIDISend(port, dest,
-                                 _packet_list(bytes([status, cc, value])))
 
-    for row, name in enumerate(BUTTON_ROWS):
-        print(f"  lighting {name} ...", flush=True)
-        blast([row], 127)
-        _pump(1.5)
-        blast([row], 0)
-        _pump(0.3)
+def _led_send(port, dest, msg):
+    err = _cm.MIDISend(port, dest, _packet_list(msg))
+    if err:
+        print(f"  MIDISend failed: {err}", flush=True)
+    _pump(0.01)
 
-    print("\nAll rows cleared.")
-    print("\nIf the lamps lit: LED feedback works, and whatever drives the")
-    print("device must echo each button's CC back. Logic's Controller")
-    print("Assignments cannot do that, so the LEDs stay dark on that route --")
-    print("only the translator daemon can light them.")
-    print("\nIf nothing lit: the lamps are firmware-internal and no software")
-    print("can drive them. Nothing further to try.")
+
+def _led_blast(port, dest, msgs, times=2):
+    for _ in range(times):
+        for msg in msgs:
+            _led_send(port, dest, msg)
+
+
+def _led_prompt(fire_on):
+    """Return (observation_str, aborted_bool)."""
+    fire_on()
+    while True:
+        try:
+            ans = input("  what lit? > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  interrupted — saving", flush=True)
+            return "(aborted)", True
+        low = ans.lower()
+        if low in ("r", "resend", "again"):
+            fire_on()
+            continue
+        if low in ("s", "skip"):
+            return "(skipped)", False
+        if low in ("q", "quit", "exit"):
+            return "(quit)", True
+        if ans == "":
+            return "(nothing / empty)", False
+        return ans, False
+
+
+def _cmd_led_scan(path, buttons, _root):
+    """Coarse A–G — the sequence that reliably lit lamps."""
+    out_dir = os.path.join(_root, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    report_path = os.path.join(out_dir, f"led-scan-{stamp}.md")
+    latest_path = os.path.join(out_dir, "led-scan-latest.md")
+
+    print(f"using {os.path.basename(path)}")
+    print("mode: --scan (coarse A–G)")
+    print(f"report → {report_path}")
+    print("Each step: ON → type what lit → OFF.  r=resend  s=skip  q=quit\n")
+
+    client, port, dest = _led_open_port()
+    mute8_ch, _t, mute8_cc = buttons[7]
+
+    def msgs_A(value):
+        out = []
+        for ch, _tt, cc in buttons:
+            out.append(bytes([0xB0 | ch, cc, value]))
+            out.append(bytes([0x90 | ch, cc, value]))
+        return out
+
+    def msgs_notes(notes, vel):
+        return [bytes([0x90, n, vel]) for n in notes]
+
+    def msgs_mute_bangs(on):
+        out = []
+        for n in range(16, 24):
+            if on:
+                out.append(bytes([0x90, n, 127]))
+            else:
+                out.append(bytes([0x90, n, 0]))
+                out.append(bytes([0x80, n, 0]))
+        return out
+
+    steps = [
+        ("A", "preset button CCs as CC + Note (original test)",
+         "all 24 buttons: CC=127 + NoteOn(note=CC) vel127",
+         msgs_A(127), msgs_A(0)),
+        ("B", "MCU MUTE notes 16-23 on ch1",
+         "NoteOn ch1 notes 16..23 vel127",
+         msgs_notes(range(16, 24), 127), msgs_notes(range(16, 24), 0)),
+        ("C", "MCU SOLO notes 8-15 on ch1",
+         "NoteOn ch1 notes 8..15 vel127",
+         msgs_notes(range(8, 16), 127), msgs_notes(range(8, 16), 0)),
+        ("D", "MCU REC notes 0-7 on ch1",
+         "NoteOn ch1 notes 0..7 vel127",
+         msgs_notes(range(0, 8), 127), msgs_notes(range(0, 8), 0)),
+        ("E", "MCU MUTE 16-23 Note On + Note Off bangs",
+         "NoteOn/Off bangs notes 16..23",
+         msgs_mute_bangs(True), msgs_mute_bangs(False)),
+        ("F", "Note 23 on ALL channels 1-16",
+         "NoteOn note23 vel127 on ch1..16",
+         [bytes([0x90 | ch, 23, 127]) for ch in range(16)],
+         [bytes([0x90 | ch, 23, 0]) for ch in range(16)]),
+        ("G", f"preset MUTE8 CC{mute8_cc} on ALL channels",
+         f"CC{mute8_cc}=127 on ch1..16",
+         [bytes([0xB0 | ch, mute8_cc, 127]) for ch in range(16)],
+         [bytes([0xB0 | ch, mute8_cc, 0]) for ch in range(16)]),
+    ]
+
+    results = []
+    aborted = False
+    for letter, title, detail, on_msgs, off_msgs in steps:
+        print("=" * 60, flush=True)
+        print(f"  [{letter}] {title}", flush=True)
+        print(f"       {detail}", flush=True)
+
+        def fire_on(on_msgs=on_msgs):
+            _led_blast(port, dest, on_msgs, times=2)
+            print("  → ON", flush=True)
+
+        ans, aborted = _led_prompt(fire_on)
+        _led_blast(port, dest, off_msgs, times=2)
+        print("  → OFF", flush=True)
+        results.append({"id": letter, "title": title, "detail": detail,
+                        "observation": ans})
+        print(f"  recorded: {ans!r}\n", flush=True)
+        if aborted:
+            break
+
+    _write_led_report(
+        report_path, latest_path, path, results, len(steps), aborted,
+        kind="coarse scan (A–G)",
+        extra_blurb=(
+            "Same multi-message blasts as the timed led --scan that lit the panel.\n"
+            "Verified 2026-07-27: B/C/D/E light MUTE+REC lamps; A/F/G do not.\n"
+            "Protocol: Note On ch1, notes ~0–23 (not CC, not note#=button CC)."
+        ),
+    )
+    try:
+        _cm.MIDIClientDispose(client)
+    except Exception:
+        pass
+    print("=" * 60)
+    print(f"DONE → {latest_path}")
+    return 0
+
+
+def _cmd_led_notes(path, buttons, _root):
+    """One ch1 Note On at a time for notes 0..23."""
+    out_dir = os.path.join(_root, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    report_path = os.path.join(out_dir, f"led-notes-{stamp}.md")
+    latest_path = os.path.join(out_dir, "led-notes-latest.md")
+
+    print(f"using {os.path.basename(path)}")
+    print("mode: --notes (ch1 Note On, one note at a time, 0..23)")
+    print(f"report → {report_path}")
+    print("Each note: ON → type which lamp(s) → OFF.")
+    print("  empty=nothing  r=resend  s=skip  q=quit\n")
+
+    client, port, dest = _led_open_port()
+
+    # MCU label hints (what DAW means; panel map is what we are learning)
+    def mcu_hint(n):
+        if 0 <= n <= 7:
+            return f"MCU REC strip {n + 1}"
+        if 8 <= n <= 15:
+            return f"MCU SOLO strip {n - 7}"
+        if 16 <= n <= 23:
+            return f"MCU MUTE strip {n - 15}"
+        return ""
+
+    results = []
+    aborted = False
+    for n in range(0, 24):
+        sid = f"N{n:02d}"
+        title = f"Note On ch1 note {n}"
+        detail = f"NoteOn ch1 note{n} vel127  ({mcu_hint(n)})"
+        print("=" * 60, flush=True)
+        print(f"  [{n + 1}/24]  {sid}  {title}", flush=True)
+        print(f"         {detail}", flush=True)
+
+        on_msgs = [bytes([0x90, n, 127])]
+        off_msgs = [bytes([0x90, n, 0]), bytes([0x80, n, 0])]
+
+        def fire_on(on_msgs=on_msgs):
+            # clear this note range first so leftover glow is less confusing
+            for nn in range(0, 24):
+                _led_send(port, dest, bytes([0x90, nn, 0]))
+                _led_send(port, dest, bytes([0x80, nn, 0]))
+            _led_blast(port, dest, on_msgs, times=4)
+            print("  → ON", flush=True)
+
+        ans, aborted = _led_prompt(fire_on)
+        _led_blast(port, dest, off_msgs, times=2)
+        for nn in range(0, 24):
+            _led_send(port, dest, bytes([0x90, nn, 0]))
+        print("  → OFF", flush=True)
+        results.append({"id": sid, "title": title, "detail": detail,
+                        "observation": ans, "note": n})
+        print(f"  recorded: {ans!r}\n", flush=True)
+        if aborted:
+            break
+
+    # extra mapping summary table for notes mode
+    extra = [
+        "Per-note map (ch1). Batch scan (2026-07-27) suggested roughly:",
+        "  notes 0–7  → MUTE 1–3, REC 1–2",
+        "  notes 8–15 → MUTE 4–5, REC 3–5",
+        "  notes 16–23→ MUTE 6–8, REC 6–7",
+        "Confirm or correct with the per-note observations below.",
+        "",
+        "| Note | MCU hint | Your observation |",
+        "|---|---|---|",
+    ]
+    for r in results:
+        obs = (r["observation"] or "").replace("|", "\\|")
+        hint = mcu_hint(r.get("note", -1)).replace("|", "\\|")
+        extra.append(f"| {r.get('note', '?')} | {hint} | {obs} |")
+    extra.append("")
+
+    _write_led_report(
+        report_path, latest_path, path, results, 24, aborted,
+        kind="per-note map (ch1 notes 0–23)",
+        extra_blurb="\n".join(extra),
+    )
+    try:
+        _cm.MIDIClientDispose(client)
+    except Exception:
+        pass
+    print("=" * 60)
+    print(f"DONE → {latest_path}")
+    return 0
+
+
+def _write_led_report(report_path, latest_path, path, results, total, aborted,
+                      kind, extra_blurb=""):
+    lines = [
+        f"# MIDI Mix LED — {kind}",
+        "",
+        f"- captured: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- preset: `{os.path.basename(path)}`",
+        f"- device: `{DEVICE_NAME}`",
+        f"- steps completed: **{len(results)}** / {total}"
+        + (" (aborted early)" if aborted else ""),
+        "",
+    ]
+    if extra_blurb:
+        lines += [extra_blurb, ""]
+    lines += [
+        "Observations are **verbatim** user input.",
+        "",
+        "| ID | What we sent | Detail | Your observation |",
+        "|---|---|---|---|",
+    ]
+    for r in results:
+        obs = (r["observation"] or "").replace("|", "\\|").replace("\n", " ")
+        title = r["title"].replace("|", "\\|")
+        detail = r["detail"].replace("|", "\\|")
+        lines.append(f"| {r['id']} | {title} | `{detail}` | {obs} |")
+    lines += ["", "## Raw notes (verbatim)", ""]
+    for r in results:
+        lines += [
+            f"### {r['id']} — {r['title']}",
+            "",
+            f"- sent: `{r['detail']}`",
+            "- observation:",
+            "",
+            "```",
+            r["observation"] or "",
+            "```",
+            "",
+        ]
+    ignore = {"(nothing / empty)", "(skipped)", "(quit)", "(aborted)", ""}
+    hits = [s for s in results if (s["observation"] or "").strip() not in ignore]
+    lines += ["## Steps with a non-empty observation", ""]
+    if not hits:
+        lines.append("(none)")
+    else:
+        for s in hits:
+            lines.append(f"- **{s['id']}** `{s['detail']}` → {s['observation']}")
+    lines.append("")
+    text = "\n".join(lines) + "\n"
+    open(report_path, "w").write(text)
+    open(latest_path, "w").write(text)
 
 
 def cmd_dump(out=None):
@@ -662,7 +933,7 @@ def cmd_ports():
 def main(argv):
     cmds = {
         "show": (cmd_show, 1, 1), "mon": (cmd_mon, 0, 6), "send": (cmd_send, 1, 1),
-        "dump": (cmd_dump, 0, 1), "led": (cmd_led, 0, 1), "diff": (cmd_diff, 2, 2), "ports": (cmd_ports, 0, 0),
+        "dump": (cmd_dump, 0, 1), "led": (cmd_led, 0, 3), "diff": (cmd_diff, 2, 2), "ports": (cmd_ports, 0, 0),
     }
     if len(argv) < 2 or argv[1] not in cmds:
         print(__doc__)

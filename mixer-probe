@@ -1,0 +1,8 @@
+#!/bin/sh
+# Phase 1 probe: virtual Mackie Control surface named "MIDI Mix MCU".
+# Keep this running, then in Logic:
+#   Control Surfaces → Setup → Install → Mackie Designs → Mackie Control
+#   set Input and Output both to "MIDI Mix MCU"
+# then type:  f 1 100
+cd "$(dirname "$0")"
+exec python3 tools/mcu_surface.py run "$@"

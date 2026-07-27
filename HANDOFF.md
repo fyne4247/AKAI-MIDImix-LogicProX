@@ -144,13 +144,16 @@ Six commits. No remote, so no PR.
 ```
 tools/midimix.py           decode / monitor / flash presets. stdlib-only CoreMIDI via
                            ctypes, native arm64. Subcommands: ports, show, diff, mon,
-                           send, dump
+                           send, dump, led
+tools/mcu_surface.py       Phase 1 virtual Mackie Control surface. Subcommands: run,
+                           selfcheck, fader. Port name: "MIDI Mix MCU"
 tools/make_logic_preset.py generates presets/logic-mode.midimix
 tools/make_mapping_doc.py  generates MAPPING.md from the preset (cannot drift)
-tools/selftest.py          16 checks, all passing
+tools/selftest.py          packet/preset checks, all passing
 presets/mgb-mode.midimix   the working Game Boy config, exported from the device
 presets/logic-mode.midimix corrected Logic layout, 57 unique addresses
 ./mgb-mode  ./logic-mode   one-command hot-swap wrappers
+./mixer-probe              start the Phase 1 virtual MCU (wrapper around mcu_surface run)
 MAPPING.md                 generated per-control mapping sheet
 README.md                  preset format, ctypes gotchas, troubleshooting
 backups/                   copy of the live Logic .cs (776 assignments)
@@ -252,19 +255,73 @@ nothing. Fixed, and `selftest.py` now round-trips `_packet_list` output back thr
 function, keep that check.
 
 ### Phase 1 — prove Logic accepts a virtual surface (the make-or-break step)
-Create a virtual CoreMIDI source+destination pair named something Logic-friendly. In
-Logic: Setup → Control Surfaces → Install → **Mackie Designs / Mackie Control** → Add,
-and point its input/output at the virtual ports. Then send a single fader move and see if
-Logic responds.
 
-**Biggest risk, flagged clearly:** Mackie/Logic Control uses a SysEx **handshake** —
-host sends a device query, the surface replies with a serial number and a
-challenge/response. If Logic requires this before accepting the surface, it must be
-emulated correctly or nothing works. The exact byte sequence is **not verified here** and
-must be checked against a reference implementation (Ardour's `mackie` control surface
-code and the community "Mackie Control protocol" notes are the usual sources). Budget
-real time for this. If Logic rejects the surface after a genuine attempt at the
-handshake, **stop and fall back to §8** rather than grinding.
+**Status 2026-07-27: PASSED (Logic accepts the virtual surface; user confirmed
+volume fader moves on outbound MCU pitch-bend).**
+
+Built: `tools/mcu_surface.py` + `./mixer-probe`. Creates a virtual CoreMIDI
+source+destination pair named **`MIDI Mix MCU`**.
+
+#### Verified against live Logic Pro 12.3 (probe log, ~16 min session)
+
+| Check | Result |
+|---|---|
+| Virtual source+dest appear in CoreMIDI | pass |
+| Cross-process delivery either direction | pass |
+| Logic Device Query on 0x10 / 0x11 / 0x14 / 0x15 / 0x17 | pass (Logic scans many ids) |
+| Full handshake on **Logic Control id 0x10** | **pass** — `algo_match=True` |
+| Challenge algorithm (TouchMCU `c2>>4` form) | **exact match** vs Logic's reply |
+| Logic → surface fader feedback (pitch bend e0–e9) | pass (324 messages) |
+| Logic → surface LCD track names | pass (`DetGar`, `RocLeg`, `80sSyn`, `EdgVoc`…) |
+| Logic → surface LED / meter / v-pot ring state | pass (~4800 host messages) |
+| Host Connection Confirmation accepted | pass (surface went fully online) |
+| Outbound fader test from probe while online | **not executed that session** — the probe was backgrounded without stdin, so `f 1 100` never reached the live process. Now fixed via auto-test + `.mcu_cmd` file. |
+
+**Do not confuse the auto-install.** Logic can auto-bind the *real* `MIDI Mix`
+hardware as a Logic Control surface. That only sees raw CCs and is useless.
+Delete any surface whose Input/Output is the real `MIDI Mix`. Only `MIDI Mix MCU`
+is the virtual surface.
+
+Channel Strip Track `262,150` in Setup = surface offline / wrong ports. After a
+good handshake it becomes normal track indices and Serial may fill in.
+
+#### Handshake (device side) — verified against Logic
+
+```
+host  →  F0 00 00 66 dd 00 F7                             Device Query
+device→  F0 00 00 66 dd 01 <7 serial> <4 challenge> F7    Host Connection Query
+host  →  F0 00 00 66 dd 02 <7 serial> <4 response>  F7    Host Connection Reply
+device→  F0 00 00 66 dd 03 <7 serial> F7                  Host Connection Confirmation
+host  →  F0 00 00 66 dd 13 00 F7                          Version Request
+device→  F0 00 00 66 dd 14 <5 version ASCII> F7           Version Reply
+```
+
+Logic completed the handshake on **`dd = 0x10` (Logic Control)** even when the
+installed model was “Mackie Control”. Challenge response matched TouchMCU:
+
+```
+r0 = 0x7F & ( c0 + (c1 ^ 0x0A) - c3 )
+r1 = 0x7F & ( (c2 >> 4) ^ (c0 + c3) )     # confirmed vs Logic, not Ardour's c2>>c3
+r2 = 0x7F & ( (c3 - (c2 << 2)) ^ (c0 | c1) )
+r3 = 0x7F & ( c1 - c2 + (0xF0 ^ (c3 << 4)) )
+```
+
+Serial = `MIDIMix` (7 ASCII). Logic also sets touchless=0 (cmd 0x0C payload 00),
+so outbound fader moves must send **touch note 104–112** around pitch bend.
+
+Faders: 14-bit Pitch Bend, ch1–8 strips, ch9 master.
+
+#### How to re-run / finish the outbound fader proof
+
+```sh
+./mixer-probe          # keep running; one instance only
+# once HANDSHAKE OK / LCD names appear, the probe auto-sends f 1 100 then f 1 40
+# or from another terminal:
+echo 'f 1 100' > .mcu_cmd
+```
+
+Commands: `f <1-9> <0-127>` | `sweep` | `ping` | `status` | `q`  
+Also: `echo '…' > .mcu_cmd` for a second-terminal inject.
 
 ### Phase 2 — faders only
 MCU faders are **14-bit Pitch Bend**, one MIDI channel per strip: channels 1–8 for strips
@@ -324,13 +381,19 @@ Still open:
 1. ~~Do the button LEDs accept MIDI feedback?~~ **Resolved: no.** Tested with
    confirmed-working output. LEDs are firmware-internal only. This is no longer
    an argument for or against any route.
-2. **The Mackie handshake.** The single biggest project risk. §6 Phase 1.
+2. ~~The Mackie handshake.~~ **Resolved against live Logic.** Handshake completes on
+   device id `0x10` with exact TouchMCU challenge match; Logic then streams fader
+   feedback, LCD names, LEDs, meters. See §6 Phase 1.
 3. **What the button `type` byte means.** Both stock presets use `1`. Observed press
    behaviour is mixed, so `type` is probably not the only factor. Low priority — it does
    not affect addressing, which is all Logic sees.
 4. **Whether `0x66` is really the preset read opcode.** Never tested. Harmless to try.
 5. **Banking without hardware support.** Since BANK L/R are dead, decide between a Logic
    key command and repurposing two REC ARM buttons.
+6. ~~Challenge r1 form.~~ **Resolved: `c2 >> 4`** matches Logic. Ardour's `c2 >> c3` is
+   wrong for this host.
+7. ~~Outbound fader → Logic volume.~~ **User confirmed volume fader moved** (2026-07-27).
+   Phase 1 closed. Proceed to Phase 2 (real MIDI Mix faders → MCU pitch bend).
 
 ## 8. Fallback if the translator fails
 

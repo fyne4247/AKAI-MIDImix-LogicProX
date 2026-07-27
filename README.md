@@ -96,6 +96,12 @@ python3 tools/midimix.py send <preset>      # flash a preset
 python3 tools/midimix.py dump [out]         # request device config (see below)
 python3 tools/make_logic_preset.py          # regenerate logic-mode.midimix
 python3 tools/selftest.py                   # parser + preset round-trip tests
+
+# Phase 1 — virtual Mackie Control surface (no MIDI Mix needed)
+./mixer-probe                               # keep running; ports named "MIDI Mix MCU"
+python3 tools/mcu_surface.py selfcheck      # algorithm + port create, no Logic
+# In Logic: Control Surfaces → Setup → Install → Mackie Designs → Mackie Control
+# set Input/Output to "MIDI Mix MCU", then in the probe type:  f 1 100
 ```
 
 ### A note on `MIDIPacketList`
