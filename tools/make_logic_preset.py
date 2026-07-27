@@ -48,14 +48,16 @@ faders = [(6, 22 + i) for i in range(9)]        # ch7, CC22..CC30
 
 # --- buttons: 3 rows of 8 on ch8, each row in its own CC block ---------------
 # Row order in the format is MUTE, REC ARM, SOLO+MUTE.
-# type byte 0 throughout, matching the known-good mGB preset.
+# Record layout is (channel, type, cc) -- NOT (type, channel, cc). Verified
+# against hardware: the mGB preset stores (0, 1, cc) and those buttons were
+# observed transmitting on ch1. type=1 matches both stock presets.
 BUTTON_CH = 7                                   # 0-based -> ch8
 BUTTON_ROW_BASE = [22, 32, 42]                  # MUTE / REC ARM / SOLO+MUTE
 
 buttons = []
 for row in range(3):
     for n in range(8):
-        buttons.append((0, BUTTON_CH, BUTTON_ROW_BASE[row] + n))
+        buttons.append((BUTTON_CH, 1, BUTTON_ROW_BASE[row] + n))
 
 
 def main():
@@ -67,7 +69,7 @@ def main():
 
     # self-check: every control must be uniquely addressable
     k, f, b = parse_preset(OUT)
-    addrs = [a for a in k] + [a for a in f] + [(ch, cc) for _, ch, cc in b]
+    addrs = [a for a in k] + [a for a in f] + [(ch, cc) for ch, _, cc in b]
     assert len(addrs) == 57, len(addrs)
     if len(set(addrs)) != 57:
         raise SystemExit(f"FAIL: only {len(set(addrs))} unique addresses")

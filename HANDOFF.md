@@ -69,18 +69,27 @@ Corollaries:
   mtime advanced while Logic was open).
 - A stable **virtual** port name would sidestep the whole slot-reuse problem.
 
-### 3.3 The downloaded 2016 preset is broken — do not flash it
+### 3.3 Button records are (channel, type, cc) — a corrected earlier claim
 
-`MIDIMix_LogicProX.midimix` (from the web) has 57 control records resolving to only **41
-unique (channel, CC) addresses**. All three button rows sit on ch2 CC22–29:
+**Retraction.** An earlier version of this document stated that the downloaded 2016
+`MIDIMix_LogicProX.midimix` was broken, with 57 records collapsing onto 41 unique
+addresses. **That was wrong.** It came from decoding button records as
+`(type, channel, cc)` when the real layout is `(channel, type, cc)`. Decoded correctly,
+that file has **57/57 unique addresses** (button rows on ch1 / ch3 / ch2, CC22–29 each)
+and is perfectly usable.
 
-```
-ch2 CC22 used by 3 controls (MUTE 1, REC ARM 1, SOLO+MUTE 1)   ... ×8
-```
+The two orderings are indistinguishable in the stock presets — both store `(0, 1, cc)` —
+and `make_logic_preset.py`'s own uniqueness self-check used the same wrong order, so it
+validated the bug instead of catching it. **Hardware measurement settled it:** under
+`mgb-mode` the buttons transmit on **ch1**, which only `(channel, type, cc)` predicts.
 
-They differ only in a per-button `type` byte which is a device-side flag and is **not
-transmitted**. Logic cannot distinguish the three button rows under that preset.
-`presets/logic-mode.midimix` (generated) fixes this: 57 controls → 57 unique addresses.
+Consequences already applied:
+- `parse_preset`, `build_preset`, `control_map`, `channels_used`, `cmd_show` and
+  `make_mapping_doc.py` corrected.
+- `presets/logic-mode.midimix` **regenerated** — the old one wrote `7` into the *type*
+  byte and left buttons on ch1, which would have collided with mGB's CC32–38 and CC42–48.
+  It was never flashed. The current file is verified 57/57 unique and disjoint from mGB.
+- The `type` byte is `1` in both stock presets; `logic-mode` now matches.
 
 ### 3.4 Faders cannot be made relative in hardware
 
@@ -92,19 +101,33 @@ argument for the translator in §5.
 Separately: **Latch vs Touch is Logic's per-track automation mode**, unrelated to any of
 this, and works regardless of route. Nothing to configure.
 
-### 3.5 The four fixed buttons
+### 3.5 The four fixed buttons — measured, they transmit nothing
 
 The panel has **20 physical buttons** (8 MUTE, 8 REC ARM, SEND ALL, BANK LEFT, BANK
 RIGHT, SOLO) but the preset stores **24 button records**. The extra row of 8 is the
-SOLO-shifted MUTE layer — the manual: *"press and hold Solo, then press the Mute buttons
-to solo their tracks."* Confirmed by arithmetic and the manual; **not yet confirmed on
-the wire.**
+SOLO-shifted MUTE layer. **Now confirmed on the wire.**
 
-- `SEND ALL` — snapshot function, retransmits all control positions. Manual warns it may
-  do nothing under pickup/takeover modes.
-- `BANK LEFT` / `BANK RIGHT` — manual says they "shift the 8 channels controlled by
-  MIDImix". **UNVERIFIED whether they transmit MIDI or are handled internally by the
-  firmware.** This is the single most important outstanding measurement. See §7.
+Measurement: a 70-second full-panel sweep, 1101 messages, produced hits on exactly the
+57 preset addresses and **nothing outside them**.
+
+- **BANK LEFT / BANK RIGHT transmit nothing.** The channel shift is entirely internal to
+  the firmware. They **cannot be mapped** — not in Logic, not by a translator. Banking
+  must come from a Logic key command or from repurposing two spare buttons. This closes
+  the project's most important open question.
+- **SEND ALL** transmits no message of its own; it retransmits every control's current
+  position, exactly as the manual describes. Observed working.
+- **SOLO is a toggle on this unit, not a press-and-hold.** The manual says hold; the
+  hardware disagrees. Press once to arm the shifted layer, again to leave it. The shifted
+  MUTE row transmits its own CC block either way.
+- **Button press behaviour is mixed** — some momentary (127 on press, 0 on release),
+  some toggling (127, then 0 on the next press). Indistinguishable on the wire: a
+  receiver sees only a CC going to 127 and later to 0.
+- **The LEDs do not light.** The manual documents no LED behaviour whatsoever. Untested
+  hypothesis: the lamps are host-driven and need the button's CC echoed back to the
+  device. `python3 tools/midimix.py led` walks each row to settle it. **If they need an
+  echo, Logic's Controller Assignments cannot supply one** — that route leaves the panel
+  dark, and only the translator daemon could light it. This is now a real argument for
+  the translator, independent of the fader-behaviour argument.
 
 ## 4. What is already built
 
@@ -136,7 +159,7 @@ does natively.
 F0 47 00 31 67 01 0A   <138 payload bytes>   F7
                  `--`-- 7-bit length pair: (0x01<<7)|0x0A = 138
               `-------- opcode 0x67 = write config
-payload = 24 knobs ×2 (channel, cc) | 9 faders ×2 (channel, cc) | 24 buttons ×3 (type, channel, cc)
+payload = 24 knobs ×2 (channel, cc) | 9 faders ×2 (channel, cc) | 24 buttons ×3 (channel, type, cc)
 ```
 Channel bytes are 0-based on the wire. `0x66` is a *guess* at the paired read opcode;
 `tools/midimix.py dump` tries it, and has never been run against the device.
@@ -145,7 +168,7 @@ Channel bytes are 0-based on the wire. `0x66` is a *guess* at the paired read op
 
 | | knobs | faders | buttons |
 |---|---|---|---|
-| mgb-mode | ch1, CC1–8 / 11–18 / 21–28 | ch1, CC61–69 | ch2, CC31–38 / 51–58 / 41–48 |
+| mgb-mode | ch1, CC1–8 / 11–18 / 21–28 | ch1, CC61–69 | ch1, CC31–38 / 51–58 / 41–48 |
 | logic-mode | ch4/5/6, CC22–29 | ch7, CC22–30 | ch8, CC22–29 / 32–39 / 42–49 |
 
 ### Known ctypes traps (all already fixed — do not reintroduce)
@@ -192,30 +215,25 @@ listens to the real MIDI Mix and translates its CCs into MCU messages.
 
 ## 6. Implementation plan
 
-### Phase 0 — measure first (blocking, ~5 min of user time)
+### Phase 0 — measure first — **DONE**
+
+Completed 2026-07-27. 70s sweep, 1101 messages, 57/57 preset controls seen, nothing
+outside the preset. Results in §3.5. The monitor is confirmed working against real
+hardware — the `MIDIPacketList` offset fix is good.
+
+Two bugs this run exposed, both since fixed: the live counter counted
+non-preset addresses toward its `n/57` total, and the summary would assert
+"banking is achievable" from unknown addresses without checking that preset coverage
+was complete — which is exactly how it reached the wrong verdict on this very capture.
+It now reports a preset mismatch when unknowns and missing controls rise together.
+
+To re-run at any point:
 
 ```sh
-cd .claude/worktrees/midimix-tooling
 python3 tools/midimix.py mon presets/mgb-mode.midimix
 ```
 
-Sweep the entire panel — every knob, every fader, every MUTE and REC ARM, then **hold
-SOLO while pressing each MUTE**, then SEND ALL / BANK LEFT / BANK RIGHT. Ctrl-C when done.
-
-**The result is written to `output.md`** as a compact summary — per-address stats, which
-preset controls were never seen, and which messages fell outside the preset. Read that
-file, not the terminal scrollback: a full sweep is thousands of messages. The live display
-prints one line per *new* control with a running `n/57` count, so it is obvious when
-coverage is complete.
-
-This confirms all 57 controls transmit, verifies the SOLO-shift theory, and — critically —
-settles whether BANK LEFT/RIGHT transmit anything. **Do not start Phase 4 without this.**
-`output.md` states the banking verdict explicitly.
-
-Note: the monitor has never successfully captured real input yet. The first attempt
-bus-errored (§4 trap 1). The fix is committed and unit-tested but **unconfirmed against
-hardware.** If it prints nothing while controls move, capture raw bytes rather than
-guessing again.
+Still worth doing once: `python3 tools/midimix.py led` — see §3.5.
 
 ### Phase 1 — prove Logic accepts a virtual surface (the make-or-break step)
 Create a virtual CoreMIDI source+destination pair named something Logic-friendly. In
@@ -254,9 +272,16 @@ Channel Left 48  Channel Right 49
 Map MIDI Mix MUTE row → MUTE, REC ARM row → REC/RDY, SOLO+MUTE layer → SOLO.
 
 ### Phase 4 — banking
-Map BANK LEFT/RIGHT to MCU notes 46/47 **if Phase 0 showed they transmit**. If they do
-not, assign two spare controls (e.g. REC ARM 7 and 8) or leave banking to a Logic key
-command.
+**BANK LEFT/RIGHT are dead ends** — Phase 0 measured them transmitting nothing (§3.5),
+so MCU notes 46/47 cannot be driven from them. Pick one instead:
+
+- **Repurpose two buttons.** REC ARM 7 and 8 are the obvious candidates; the translator
+  maps them to MCU notes 46/47 rather than to record-enable. Costs two record-arms.
+- **Logic key command.** Leave the panel out of it entirely. Costs nothing, but means
+  reaching for the keyboard.
+
+Recommendation: repurpose REC ARM 7/8, since the whole point is to stop touching the
+keyboard. Make it a constant at the top of the daemon so it is trivial to change.
 
 ### Phase 5 — knobs (pan / sends) and soft-takeover
 MCU V-Pots are **relative** encoders on CC 16–23, encoded as 0x01–0x3F = clockwise ticks,
@@ -274,16 +299,21 @@ documentation of the Logic-side setup. Commit and update README.
 
 ## 7. Outstanding unknowns
 
-1. **Do BANK LEFT/RIGHT transmit MIDI?** Blocking for Phase 4. Phase 0 answers it.
-2. **Does the monitor actually work against hardware?** Fix is committed and unit-tested,
-   never confirmed live.
-3. **The Mackie handshake.** The single biggest project risk. §6 Phase 1.
-4. **What the button `type` byte (0/1/2) means.** Probably toggle vs momentary; the AKAI
-   editor exposes it as a checkbox. Currently set to 0 everywhere, matching the
-   known-good mGB preset. Determine empirically: momentary sends 127-on-press /
-   0-on-release, toggle alternates.
-5. **Whether `0x66` is really the preset read opcode.** Never tested against the device.
-   Harmless to try — unrecognised SysEx is ignored.
+Resolved since the first draft: BANK LEFT/RIGHT **do not transmit** (§3.5); the monitor
+**does** work against hardware; the button record byte order is `(channel, type, cc)`
+(§3.3); the SOLO-shift layer is real and SOLO toggles rather than holds.
+
+Still open:
+
+1. **Do the button LEDs accept MIDI feedback?** Run `tools/midimix.py led`. Decides
+   whether the panel can ever show state, and is now an argument for the translator.
+2. **The Mackie handshake.** The single biggest project risk. §6 Phase 1.
+3. **What the button `type` byte means.** Both stock presets use `1`. Observed press
+   behaviour is mixed, so `type` is probably not the only factor. Low priority — it does
+   not affect addressing, which is all Logic sees.
+4. **Whether `0x66` is really the preset read opcode.** Never tested. Harmless to try.
+5. **Banking without hardware support.** Since BANK L/R are dead, decide between a Logic
+   key command and repurposing two REC ARM buttons.
 
 ## 8. Fallback if the translator fails
 

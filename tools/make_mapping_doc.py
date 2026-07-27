@@ -46,7 +46,7 @@ def main():
             w(f"| Fader {i + 1} | ch{ch + 1} CC{cc} | **Volume**, track {i + 1} |")
     for row in range(3):
         for n in range(8):
-            _t, ch, cc = buttons[row * 8 + n]
+            ch, _t, cc = buttons[row * 8 + n]
             label = ["MUTE", "REC ARM", "SOLO+MUTE"][row]
             w(f"| {label} {n + 1} | ch{ch + 1} CC{cc} | **{BUTTON_ROW_TARGET[row]}**, "
               f"track {n + 1} |")

@@ -7,6 +7,7 @@ Subcommands:
                                 live-monitor; writes a summary to output.md
     send <preset.midimix>       flash a preset to the device
     dump [out.midimix]          ask the device for its current config
+    led  [preset]               test whether the button LEDs accept feedback
 
 Preset format (reverse-engineered, verified against two independent presets):
 
@@ -19,7 +20,7 @@ Preset format (reverse-engineered, verified against two independent presets):
 
     payload = 24 knobs  x 2 bytes (channel, cc)   strip order, 3 per strip
             +  9 faders x 2 bytes (channel, cc)   1-8 then MASTER
-            + 24 buttons x 3 bytes (type, channel, cc)
+            + 24 buttons x 3 bytes (channel, type, cc)
 
     Channel bytes are 0-based on the wire; this tool prints them 1-based.
 
@@ -71,8 +72,8 @@ def build_preset(knobs, faders, buttons):
         out += bytes([ch, cc])
     for ch, cc in faders:
         out += bytes([ch, cc])
-    for t, ch, cc in buttons:
-        out += bytes([t, ch, cc])
+    for ch, t, cc in buttons:
+        out += bytes([ch, t, cc])
     assert len(out) == 7 + PAYLOAD_LEN, len(out)
     out.append(0xF7)
     return bytes(out)
@@ -85,13 +86,13 @@ def control_map(knobs, faders, buttons):
         m[(ch, cc)] = f"knob row{i % 3 + 1} strip{i // 3 + 1}"
     for i, (ch, cc) in enumerate(faders):
         m[(ch, cc)] = f"fader {'MASTER' if i == 8 else i + 1}"
-    for i, (t, ch, cc) in enumerate(buttons):
+    for i, (ch, t, cc) in enumerate(buttons):
         m[(ch, cc)] = f"{BUTTON_ROWS[i // 8]} {i % 8 + 1}"
     return m
 
 
 def channels_used(knobs, faders, buttons):
-    return sorted({ch + 1 for ch, _ in knobs + faders} | {b[1] + 1 for b in buttons})
+    return sorted({ch + 1 for ch, _ in knobs + faders} | {b[0] + 1 for b in buttons})
 
 
 def cmd_show(path):
@@ -111,8 +112,8 @@ def cmd_show(path):
     print("\n-- buttons (24) --")
     for row in range(3):
         rec = buttons[row * 8:row * 8 + 8]
-        types = sorted({t for t, _, _ in rec})
-        cells = " ".join(f"ch{ch + 1}/CC{cc}" for _, ch, cc in rec)
+        types = sorted({t for _, t, _ in rec})
+        cells = " ".join(f"ch{ch + 1}/CC{cc}" for ch, _, cc in rec)
         print(f"  {BUTTON_ROWS[row]:<10} type={types}  {cells}")
 
     print(f"\n  MIDI channels used: {channels_used(knobs, faders, buttons)}")
@@ -406,7 +407,9 @@ def cmd_mon(*args):
         state["total"] += 1
         if not quiet and state["last"] != key:
             label = labels.get(key) or f"{YEL}NOT IN PRESET{RST}"
-            print(f"  [{len(stats):2}/57] ch{ch + 1:<2} CC{msg[1]:<3}  {label}", flush=True)
+            nk = sum(1 for k in stats if k in labels)
+            print(f"  [{nk:2}/{len(labels) or 57}] ch{ch + 1:<2} CC{msg[1]:<3}  {label}",
+                  flush=True)
         state["last"] = key
 
     client, _port, _proc = _listen(on_msg)  # _proc must stay referenced
@@ -442,8 +445,10 @@ def _write_summary(path, preset, labels, stats, total, elapsed):
     L.append(f"- captured: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     L.append(f"- preset: `{os.path.basename(preset) if preset else '(none)'}`")
     L.append(f"- duration: {elapsed}s, {total} messages")
-    L.append(f"- distinct controls seen: **{len(seen)}**"
-             + (f" of {len(labels)} in the preset" if labels else ""))
+    L.append(f"- distinct addresses seen: **{len(seen)}**")
+    if labels:
+        L.append(f"- matching the preset: **{len(known)}** of {len(labels)}")
+        L.append(f"- outside the preset: **{len(unknown)}**")
     L.append("")
 
     if not seen:
@@ -456,35 +461,55 @@ def _write_summary(path, preset, labels, stats, total, elapsed):
         L.append("- `python3 tools/midimix.py ports` should list it")
         L.append("- if the monitor previously crashed, the parser fix may still be wrong")
     else:
-        if unknown:
-            L.append("## NOT in the preset")
+        if unknown and len(missing) >= 8 and len(unknown) >= len(known) // 2:
+            L.append("## Preset mismatch suspected")
             L.append("")
-            L.append("These are the firmware-fixed buttons (SEND ALL / BANK LEFT /")
-            L.append("BANK RIGHT / SOLO). **They transmit, so they are mappable.**")
+            L.append(f"{len(unknown)} addresses arrived that the preset does not")
+            L.append(f"describe, while {len(missing)} preset controls were never seen.")
+            L.append("Those two numbers moving together means the preset being used for")
+            L.append("labels does not match what is flashed on the device -- **not** that")
+            L.append("the fixed buttons transmit.")
+            L.append("")
+            L.append("**No banking verdict can be drawn from this run.** Fix the preset")
+            L.append("or re-flash the device, then re-run.")
             L.append("")
             L.append("| Address | Type | Values | Msgs |")
             L.append("|---|---|---|---|")
-            for (ch, cc), s in sorted(unknown.items()):
-                kind = "Note" if s["note"] else "CC"
-                L.append(f"| ch{ch + 1} {kind}{cc} | {kind} | {s['lo']}–{s['hi']} | {s['n']} |")
+            for (ch, cc), st in sorted(unknown.items()):
+                kind = "Note" if st["note"] else "CC"
+                L.append(f"| ch{ch + 1} {kind}{cc} | {kind} | {st['lo']}-{st['hi']} | {st['n']} |")
+        elif unknown:
+            L.append("## NOT in the preset")
             L.append("")
-            L.append("**=> Banking is achievable.** Map BANK LEFT/RIGHT to MCU notes")
-            L.append("46/47 (translator route) or to track banking in Controller")
-            L.append("Assignments.")
+            L.append("| Address | Type | Values | Msgs |")
+            L.append("|---|---|---|---|")
+            for (ch, cc), st in sorted(unknown.items()):
+                kind = "Note" if st["note"] else "CC"
+                L.append(f"| ch{ch + 1} {kind}{cc} | {kind} | {st['lo']}-{st['hi']} | {st['n']} |")
+            L.append("")
+            if len(known) >= len(labels) - 2:
+                L.append("Preset coverage is complete, so these are genuinely extra")
+                L.append("messages -- the firmware-fixed buttons (SEND ALL / BANK LEFT /")
+                L.append("BANK RIGHT / SOLO). **They transmit, so they are mappable.**")
+                L.append("")
+                L.append("**=> Banking is achievable.**")
+            else:
+                L.append(f"Only {len(known)}/{len(labels)} preset controls were covered, so")
+                L.append("these extras cannot yet be attributed to the fixed buttons.")
         else:
             L.append("## NOT in the preset")
             L.append("")
-            if len(seen) >= 50:
+            if len(known) >= len(labels) - 2:
                 L.append("Nothing. Across a full sweep, every message matched the preset.")
                 L.append("")
                 L.append("**=> SEND ALL / BANK LEFT / BANK RIGHT transmit nothing of their")
-                L.append("own** — they are handled internally by the firmware and cannot")
+                L.append("own** -- they are handled internally by the firmware and cannot")
                 L.append("be mapped. Use a Logic key command for banking, or repurpose")
                 L.append("two spare buttons.")
             else:
-                L.append(f"Nothing — but only {len(seen)} of 57 controls were covered, so")
-                L.append("this is **not conclusive**. Re-run and work through all five")
-                L.append("steps before deciding about the fixed buttons.")
+                L.append(f"Nothing -- but only {len(known)} of {len(labels)} preset controls")
+                L.append("were covered, so this is **not conclusive**. Re-run and work")
+                L.append("through all five steps.")
         L.append("")
 
         if missing:
@@ -513,15 +538,12 @@ def _write_summary(path, preset, labels, stats, total, elapsed):
     with open(path, "w") as fh:
         fh.write("\n".join(L) + "\n")
 
-    print(f"\n\n--- {len(seen)} distinct controls, {total} messages ---")
-    print(f"summary written to {path}")
-    if unknown:
-        print(f"{len(unknown)} address(es) NOT in the preset -> the fixed buttons "
-              f"DO transmit")
-    elif len(seen) >= 50:
-        print("nothing outside the preset -> the fixed buttons transmit nothing")
-    elif seen:
-        print(f"only {len(seen)}/57 controls covered -- not conclusive, re-run")
+    nknown = len(set(stats) & set(labels)) if labels else 0
+    nunk = len(set(stats) - set(labels))
+    print(f"\n\n--- {len(stats)} distinct addresses, {total} messages ---")
+    print(f"summary written to {os.path.abspath(path)}")
+    if labels:
+        print(f"preset matches {nknown}/{len(labels)}, outside preset {nunk}")
 
 
 # --------------------------------------------------------------------------
@@ -534,6 +556,50 @@ def cmd_send(path):
     print(f"flashing {os.path.basename(path)}  channels={channels_used(knobs, faders, buttons)}")
     send_raw(blob)
     print("done. Run `mon` to confirm the device now reports these channels.")
+
+
+def cmd_led(preset=None):
+    """led [preset] -- walk the button LEDs to see whether the device accepts
+    LED feedback over MIDI.
+
+    The MIDI Mix manual documents no LED behaviour at all. The open question is
+    whether the lamps are driven by the firmware on press (self-lighting) or by
+    the host echoing the button's own CC back to the device. If it is the
+    latter, Logic will never light them on its own and the translator has to do
+    it -- which is the whole point of testing this before building anything.
+    """
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = preset or os.path.join(_root, "presets", "mgb-mode.midimix")
+    knobs, faders, buttons = parse_preset(path)
+    print(f"using {os.path.basename(path)}")
+    print("\nWatch the button LEDs. Each row lights for 1.5s, then clears.\n")
+
+    dest = find_endpoint("dest")
+    port = Ref()
+    if _cm.MIDIOutputPortCreate(_client(), _cfstr("led"), ctypes.byref(port)):
+        raise SystemExit("MIDIOutputPortCreate failed")
+
+    def blast(rows, value):
+        for row in rows:
+            for ch, _t, cc in buttons[row * 8:row * 8 + 8]:
+                for status in (0xB0 | ch, 0x90 | ch):   # try CC, then Note On
+                    _cm.MIDISend(port, dest,
+                                 _packet_list(bytes([status, cc, value])))
+
+    for row, name in enumerate(BUTTON_ROWS):
+        print(f"  lighting {name} ...", flush=True)
+        blast([row], 127)
+        _pump(1.5)
+        blast([row], 0)
+        _pump(0.3)
+
+    print("\nAll rows cleared.")
+    print("\nIf the lamps lit: LED feedback works, and whatever drives the")
+    print("device must echo each button's CC back. Logic's Controller")
+    print("Assignments cannot do that, so the LEDs stay dark on that route --")
+    print("only the translator daemon can light them.")
+    print("\nIf nothing lit: the lamps are firmware-internal and no software")
+    print("can drive them. Nothing further to try.")
 
 
 def cmd_dump(out=None):
@@ -587,7 +653,7 @@ def cmd_ports():
 def main(argv):
     cmds = {
         "show": (cmd_show, 1, 1), "mon": (cmd_mon, 0, 6), "send": (cmd_send, 1, 1),
-        "dump": (cmd_dump, 0, 1), "diff": (cmd_diff, 2, 2), "ports": (cmd_ports, 0, 0),
+        "dump": (cmd_dump, 0, 1), "led": (cmd_led, 0, 1), "diff": (cmd_diff, 2, 2), "ports": (cmd_ports, 0, 0),
     }
     if len(argv) < 2 or argv[1] not in cmds:
         print(__doc__)
