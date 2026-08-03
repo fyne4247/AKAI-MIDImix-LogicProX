@@ -1,64 +1,29 @@
 #!/usr/bin/env python3
-"""Phase 1: virtual Mackie Control surface for Logic Pro.
+"""AKAI MIDI Mix to Logic Pro Mackie Control bridge.
 
-Creates a CoreMIDI source+destination pair named "MIDI Mix MCU" that speaks
-the Mackie / Logic Control handshake and can emit MCU fader messages.
+The physical controller uses the CC/note layout in
+``MIDIMix_LogicProX2026.midimix``. This process translates it into one virtual
+Logic Control surface for banked tracks plus a separate fixed-control source
+for the nonbanked Master fader and optional custom knob assignments.
 
-Handshake (device side — TouchMCU protocol notes + Ardour host code)
--------------------------------------------------------------------
-    host  ->  F0 00 00 66 dd 00 F7                          Device Query
-    device->  F0 00 00 66 dd 01 <7 serial> <4 challenge> F7 Host Connection Query
-    host  ->  F0 00 00 66 dd 02 <7 serial> <4 response>  F7 Host Connection Reply
-    device->  F0 00 00 66 dd 03 <7 serial> F7               Host Connection Confirmation
-    host  ->  F0 00 00 66 dd 13 00 F7                       Version Request (optional)
-    device->  F0 00 00 66 dd 14 <5 version> F7              Version Reply
-
-Logic probes several identities on a new port. This bridge answers only as the
-base Logic Control (`dd = 0x10`): answering `0x11` creates a Logic Control XT
-extender, whose faders work but whose bank buttons do not own navigation.
-
-Faders are 14-bit Pitch Bend (ch 1-8 = strips, ch 9 = master). Logic's default
-is touch-sensitive: we send Note On 104-112 (touch) around each move.
-
-Usage
------
-    ./mixer-probe                         # or: python3 tools/mcu_surface.py run
-    python3 tools/mcu_surface.py selfcheck
-
-While running, type:
-    f 1 100     strip-1 fader → 100/127  (sends touch + pitch bend)
-    f 9 64      master
-    sweep       walk all 9 faders
-    ping        re-announce both device IDs
-    status      connection state
-    q           quit
-
-Logic setup (critical order)
-----------------------------
-1. Start ./mixer-probe FIRST (ports must exist before Install).
-2. Delete any auto-installed "Logic Control" that points at the real
-   "MIDI Mix" hardware — that only sees CCs and will confuse things.
-3. Control Surfaces → Setup → New → Install → Mackie Designs →
-   Mackie Control → Add.
-4. Set Input AND Output to "MIDI Mix MCU" (exactly one of each).
-5. Close the Setup window (surfaces often only go fully online after).
-6. Open a project with real tracks. Channel Strip Track should become a
-   normal number (1, 2, …) — NOT 262150.
-7. In the probe: f 1 100
+Run with ``mixer-mode.command``. While it is open, type ``help`` for the small
+set of supported runtime commands. See README.md for the one-time Logic and
+hardware-preset setup.
 """
 
 from __future__ import annotations
 
-import atexit
 import ctypes
+import fcntl
 import os
+import queue
 import select
 import sys
 import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import midimix as M  # noqa: E402
+import coremidi as M  # noqa: E402
 
 # --------------------------------------------------------------------------
 # constants
@@ -75,15 +40,11 @@ VERSION = b"V1.00"            # 5 ASCII bytes
 CLIENT_NAME = "mcu_surface.py"
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PID_PATH = os.path.join(_ROOT, ".mcu_surface.pid")
-# Second terminal can inject commands while run is up:
-#   echo "f 1 100" > .mcu_cmd
-CMD_PATH = os.path.join(_ROOT, ".mcu_cmd")
 
 CMD_DEVICE_QUERY = 0x00
 CMD_HOST_CONN_QUERY = 0x01
 CMD_HOST_CONN_REPLY = 0x02
 CMD_HOST_CONN_CONFIRM = 0x03
-CMD_HOST_CONN_ERROR = 0x04
 CMD_TOUCHLESS = 0x0C
 CMD_VERSION_REQUEST = 0x13
 CMD_VERSION_REPLY = 0x14
@@ -93,20 +54,28 @@ CMD_RESET = 0x63
 # Fader touch notes (ch 1): strip1=104 … strip8=111, master=112
 TOUCH_NOTE_BASE = 104
 
-# The current mgb70 preset leaves the fixed panel buttons on their firmware
+# The current MIDIMix_LogicProX2026 preset leaves the fixed panel buttons on their firmware
 # notes: BANK LEFT=25, BANK RIGHT=26, SOLO=27. Its third knob row was moved to
 # CC71..78, so the fixed buttons cannot collide with it.
 # Its nine faders remain channel 1 (wire channel 0), CC61 through CC69.
 MGB_FADER_CCS = {61 + i: i + 1 for i in range(9)}
 MGB_BANK_BUTTON_NOTES = {25: "left", 26: "right"}
+# MIDIMix_LogicProX2026 programmable channel buttons (wire channel 0 = display ch1).
+MGB_MUTE_CCS = {31 + i: i + 1 for i in range(8)}      # strip 1..8
+MGB_REC_CCS = {51 + i: i + 1 for i in range(8)}
+MGB_SOLO_LAYER_CCS = {41 + i: i + 1 for i in range(8)}  # SOLO held + MUTE
+MGB_SOLO_BUTTON_NOTE = 27  # firmware fixed; local layer only, not mapped to Logic
+# Knob CCs from MIDIMix_LogicProX2026 preset (all on wire channel 0 = display ch1)
+MGB_KNOB_ROW1_CCS = {1 + i: i + 1 for i in range(8)}   # CC1-8 → strip 1-8
+MGB_KNOB_ROW2_CCS = {11 + i: i + 1 for i in range(8)}  # CC11-18 → strip 1-8
+MGB_KNOB_ROW3_CCS = {71 + i: i + 1 for i in range(8)}  # CC71-78 → strip 1-8
+MGB_KNOB_ROWS = {1: MGB_KNOB_ROW1_CCS, 2: MGB_KNOB_ROW2_CCS, 3: MGB_KNOB_ROW3_CCS}
 FADER_TOUCH_RELEASE_SECS = 0.18
 
-# Logic currently maps MCU strip 8 to its Stereo Out, but does not act on the
-# dedicated MCU master-fader lane (strip 9). Keep the physical MASTER useful by
-# routing it to that proven Stereo Out lane. This is deliberately a constant:
-# banking can later choose whether it follows the MCU bank or gets a dedicated
-# fixed-output route.
-PHYSICAL_MASTER_TARGET_STRIP = 8
+# MCU channel-strip button notes on channel 1 (Logic / Mackie protocol).
+MCU_REC_NOTE_BASE = 0     # strips 1..8 → notes 0..7
+MCU_SOLO_NOTE_BASE = 8    # strips 1..8 → notes 8..15
+MCU_MUTE_NOTE_BASE = 16   # strips 1..8 → notes 16..23
 
 # A separate stable virtual source for the one thing that must never follow an
 # MCU bank: the physical MASTER fader → Logic Master volume. It is kept
@@ -120,6 +89,52 @@ FIXED_MASTER_CC = 119
 MCU_BANK_LEFT_NOTE = 46
 MCU_BANK_RIGHT_NOTE = 47
 MCU_HOME_BANK_PRESSES = 16
+
+MCU_VPOT_CC_BASE = 0x10  # CC16, strips 1-8 — relative encoding
+
+# SEND ALL has no unique programmable message. With the shipped preset it
+# reports this snapshot burst; treating it as normal input would move Master
+# and several knobs. Suppress the complete burst when CoreMIDI delivers it
+# together.
+SEND_ALL_BURST_CCS = frozenset((1, 3, 5, 7, 69))
+SEND_ALL_WINDOW_SECS = 0.035
+
+KNOB_LAYOUT_PATH = os.path.join(_ROOT, ".knob_layout")
+KNOB_LAYOUTS = ("fixed", "vpot", "disabled")
+DEFAULT_KNOB_LAYOUT = "fixed"
+
+# In "fixed" layout, knobs emit absolute CCs on MIDI Mix Fixed (ch16).
+# They are intentionally blank, unique learn targets—not a hard-wired send map.
+# Row 1 CC1-8, row 2 CC11-18, row 3 CC71-78.
+# These don't collide with the master fader (CC119) on the same port.
+KNOB_FIXED_CC = {
+    (1, s): s for s in range(1, 9)         # row1 → CC1-8
+} | {
+    (2, s): 10 + s for s in range(1, 9)    # row2 → CC11-18
+} | {
+    (3, s): 70 + s for s in range(1, 9)    # row3 → CC71-78
+}
+
+SOFT_TAKEOVER_TOLERANCE = 2  # 0-127 units; fader is "at" host value within this
+SOFT_TAKEOVER_PATH = os.path.join(_ROOT, ".soft_takeover")
+
+
+def _load_knob_layout() -> str:
+    try:
+        layout = open(KNOB_LAYOUT_PATH).read().strip()
+        if layout in KNOB_LAYOUTS:
+            return layout
+    except OSError:
+        pass
+    return DEFAULT_KNOB_LAYOUT
+
+
+def _load_soft_takeover() -> bool:
+    try:
+        val = open(SOFT_TAKEOVER_PATH).read().strip().lower()
+        return val != "off"
+    except OSError:
+        return True  # default on
 
 
 # --------------------------------------------------------------------------
@@ -152,10 +167,6 @@ def msg_host_connection_query(challenge: bytes, device_id: int) -> bytes:
 
 def msg_host_connection_confirm(device_id: int) -> bytes:
     return sysex(device_id, CMD_HOST_CONN_CONFIRM, SERIAL)
-
-
-def msg_host_connection_error(device_id: int) -> bytes:
-    return sysex(device_id, CMD_HOST_CONN_ERROR, SERIAL)
 
 
 def msg_version_reply(device_id: int) -> bytes:
@@ -204,10 +215,10 @@ def parse_mgb_fader(msg: bytes):
 
 
 def parse_mgb_bank_button(msg: bytes):
-    """Return ``(direction, pressed)`` for mgb70's fixed bank buttons.
+    """Return ``(direction, pressed)`` for MIDIMix_LogicProX2026's fixed bank buttons.
 
     These hardware buttons are firmware-fixed Note 25/26. In the original mGB
-    preset those note numbers were easily confused with knob CC25/26; mgb70
+    preset those note numbers were easily confused with knob CC25/26; the 2026 preset
     moves that knob row to CC71..78, making the separation obvious.
     """
     if len(msg) < 3:
@@ -221,6 +232,72 @@ def parse_mgb_bank_button(msg: bytes):
     return direction, kind == 0x90 and msg[2] != 0
 
 
+def parse_mgb_channel_button(msg: bytes):
+    """Return ``(kind, strip, pressed)`` for MUTE / REC / SOLO-layer CCs.
+
+    kind is \"mute\", \"rec\", or \"solo\" (SOLO held + MUTE strip).
+    pressed is True when value >= 64 (momentary or toggle 0/127).
+    """
+    if len(msg) < 3 or msg[0] != 0xB0:
+        return None
+    cc, val = msg[1], msg[2]
+    if cc in MGB_MUTE_CCS:
+        return "mute", MGB_MUTE_CCS[cc], val >= 64
+    if cc in MGB_REC_CCS:
+        return "rec", MGB_REC_CCS[cc], val >= 64
+    if cc in MGB_SOLO_LAYER_CCS:
+        return "solo", MGB_SOLO_LAYER_CCS[cc], val >= 64
+    return None
+
+
+def mcu_channel_button_note(kind: str, strip: int) -> int:
+    """MCU note number for a channel-strip button (strip 1..8)."""
+    if not 1 <= strip <= 8:
+        raise ValueError(f"strip must be 1..8, got {strip}")
+    if kind == "mute":
+        return MCU_MUTE_NOTE_BASE + strip - 1
+    if kind == "solo":
+        return MCU_SOLO_NOTE_BASE + strip - 1
+    if kind == "rec":
+        return MCU_REC_NOTE_BASE + strip - 1
+    raise ValueError(f"unknown button kind {kind!r}")
+
+
+def hardware_led_note(kind: str, strip: int):
+    """AKAI panel LED note (ch1) for mute/solo/rec, or None if no lamp.
+
+    Base-3 map from output/led-note-map.md. REC 8 is the logical extension
+    note 24 (= 3*8); confirmed only after the extended note scan if present.
+    """
+    if not 1 <= strip <= 8:
+        return None
+    if kind == "mute":
+        return 3 * (strip - 1) + 1          # SOLO released layer
+    if kind == "solo":
+        return 3 * (strip - 1) + 2          # SOLO held / software-solo layer
+    if kind == "rec":
+        return 3 * strip                     # RA1..8 → notes 3,6,...,24
+    return None
+
+
+def parse_mcu_led_note(msg: bytes):
+    """If msg is an MCU LED note from Logic, return ``(kind, strip, on)``."""
+    if len(msg) < 3:
+        return None
+    kind, channel = msg[0] & 0xF0, msg[0] & 0x0F
+    if channel != 0 or kind not in (0x90, 0x80):
+        return None
+    note, vel = msg[1], msg[2]
+    on = kind == 0x90 and vel >= 64
+    if MCU_MUTE_NOTE_BASE <= note <= MCU_MUTE_NOTE_BASE + 7:
+        return "mute", note - MCU_MUTE_NOTE_BASE + 1, on
+    if MCU_SOLO_NOTE_BASE <= note <= MCU_SOLO_NOTE_BASE + 7:
+        return "solo", note - MCU_SOLO_NOTE_BASE + 1, on
+    if MCU_REC_NOTE_BASE <= note <= MCU_REC_NOTE_BASE + 7:
+        return "rec", note - MCU_REC_NOTE_BASE + 1, on
+    return None
+
+
 def mcu_button_press(note: int) -> list:
     """Return a complete press/release for an MCU button on channel 1."""
     if not 0 <= note <= 127:
@@ -228,34 +305,66 @@ def mcu_button_press(note: int) -> list:
     return [bytes([0x90, note, 127]), bytes([0x80, note, 0])]
 
 
+def parse_mgb_knob(msg: bytes):
+    """Return ``(row, strip, value)`` for a 2026-preset knob CC, or None."""
+    if len(msg) < 3 or msg[0] != 0xB0:
+        return None
+    cc = msg[1]
+    for row, ccs in MGB_KNOB_ROWS.items():
+        strip = ccs.get(cc)
+        if strip is not None:
+            return row, strip, msg[2]
+    return None
+
+
+def vpot_relative(strip: int, delta: int) -> list[bytes]:
+    """Conservative MCU V-Pot ticks for one absolute-knob movement.
+
+    The MIDI Mix pots can jump by many absolute units between samples. Mackie
+    V-Pots are relative encoders, so translate only the direction and a small
+    bounded amount. This avoids undefined high relative values and prevents a
+    single noisy sample from sweeping a send.
+    """
+    if not 1 <= strip <= 8:
+        raise ValueError(f"strip must be 1..8, got {strip}")
+    if delta == 0:
+        return []
+    cc = MCU_VPOT_CC_BASE + strip - 1
+    value = 0x01 if delta > 0 else 0x41
+    repeats = min(abs(delta), 4)
+    return [bytes([0xB0, cc, value])] * repeats
+
+
+def _crosses(prev, current: int, target: int) -> bool:
+    """True if the physical fader crossed or matched the host value."""
+    if abs(current - target) <= SOFT_TAKEOVER_TOLERANCE:
+        return True
+    if prev is None:
+        return False
+    return (prev < target <= current) or (prev > target >= current)
+
+
 # --------------------------------------------------------------------------
 # single-instance lock
 # --------------------------------------------------------------------------
 
 def _acquire_pid_lock():
-    """Refuse to start a second probe — duplicate 'MIDI Mix MCU' ports break Logic."""
-    if os.path.exists(PID_PATH):
-        try:
-            old = int(open(PID_PATH).read().strip())
-            os.kill(old, 0)  # raises if dead
-            raise SystemExit(
-                f"another mcu_surface is already running (pid {old}).\n"
-                f"Kill it first:  kill {old}\n"
-                f"Or:  pkill -f mcu_surface.py\n"
-                f"Duplicate ports with the same name make Logic bind to the wrong one.")
-        except (ValueError, ProcessLookupError, PermissionError):
-            pass  # stale pid file
-    with open(PID_PATH, "w") as fh:
-        fh.write(str(os.getpid()))
-
-    def _clear():
-        try:
-            if os.path.exists(PID_PATH) and open(PID_PATH).read().strip() == str(os.getpid()):
-                os.remove(PID_PATH)
-        except OSError:
-            pass
-
-    atexit.register(_clear)
+    """Hold an OS lock so duplicate virtual ports cannot be created."""
+    lock_file = open(PID_PATH, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        raise SystemExit(
+            f"another mixer bridge is already running (pid {owner}).\n"
+            "Quit its mixer-mode.command window before starting another.")
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
 
 
 # --------------------------------------------------------------------------
@@ -273,16 +382,29 @@ class VirtualMCU:
         self.touchless = False  # Logic may enable via cmd 0x0C
         self.quiet = True       # suppress high-rate meter / LED chatter
         self._meter_count = 0
+        self._incoming = queue.SimpleQueue()
+        self._closing = False
         # Last fader positions Logic sent us (0..1), keyed by strip 1..9
         self.host_faders = {}
-        self._lock = threading.Lock()
+        self._logic_led_state = {}  # (kind, strip) -> bool
         self._mix_msg_count = 0
         self._mix_last_value = {}
         self._mix_touches = {}  # strip -> monotonic release deadline
+        self._send_all_pending = []  # (timestamp, message)
+        self._btn_state = {}    # (kind, strip) -> pressed bool
+        self._solo_key_down = False
+        # Software SOLO layer: tap SOLO (Note 27) toggles. While latched, MUTE
+        # CCs are sent as MCU Solo, and solo LED state is painted on the mute
+        # lamps so you can see it without holding SOLO.
+        self.solo_mode_latched = False
         self.mix_connected = False
-        # The one-time Logic assignment on MIDI Mix Fixed is now the permanent
-        # Master route. It remains independent of every MCU bank.
-        self.master_route = "fixed"
+        self.mix_out_ok = False
+        self.soft_takeover_enabled = _load_soft_takeover()
+        self._soft_takeover = {}     # strip -> True (tracking) or absent (suppressed)
+        self._phys_fader_last = {}   # strip -> last physical value 0-127
+        self._phys_fader_sent_at = {}  # strip -> monotonic send time
+        self._knob_last = {}         # (row, strip) -> last absolute value
+        self._knob_layout = _load_knob_layout()
 
         self._on_dest_read = M.READ_PROC(self._dest_callback)
         self._on_mix_read = M.READ_PROC(self._mix_callback)
@@ -299,6 +421,9 @@ class VirtualMCU:
              [M.Ref, ctypes.c_void_p, M.READ_PROC, ctypes.c_void_p, M.RefP]),
             ("MIDIReceived", M.OSStatus, [M.Ref, ctypes.c_void_p]),
             ("MIDIEndpointDispose", M.OSStatus, [M.Ref]),
+            ("MIDIOutputPortCreate", M.OSStatus,
+             [M.Ref, ctypes.c_void_p, M.RefP]),
+            ("MIDISend", M.OSStatus, [M.Ref, M.Ref, ctypes.c_void_p]),
         ]:
             getattr(M._cm, fn).restype = res
             getattr(M._cm, fn).argtypes = args
@@ -326,24 +451,41 @@ class VirtualMCU:
         # virtual MCU ports. CoreMIDI fans a source out to multiple clients, so
         # this does not interfere with other MIDI users.
         self.mix_input = M.Ref()
+        self.mix_output = M.Ref()
+        self.mix_dest = None
         try:
             mix_source = M.find_endpoint("source")
         except SystemExit:
-            self.log("real 'MIDI Mix' is not present — virtual probe only")
+            self.log("real 'MIDI Mix' input is not present — controls are unavailable")
         else:
             err = M._cm.MIDIInputPortCreate(
-                self.client, M._cfstr("MIDI Mix faders"), self._on_mix_read, None,
+                self.client, M._cfstr("MIDI Mix in"), self._on_mix_read, None,
                 ctypes.byref(self.mix_input))
             if err:
-                self.log(f"could not listen to real MIDI Mix ({err}) — virtual probe only")
+                self.log(f"could not listen to real MIDI Mix ({err}) — controls unavailable")
             else:
                 err = M._cm.MIDIPortConnectSource(self.mix_input, mix_source, None)
                 if err:
-                    self.log(f"could not connect real MIDI Mix ({err}) — virtual probe only")
+                    self.log(f"could not connect real MIDI Mix ({err}) — controls unavailable")
                 else:
                     self.mix_connected = True
-                    self.log("listening to MIDI Mix: faders ch1 CC61–69; "
-                             "banks Note25/26 (mgb70 preset)")
+                    self.log("listening to MIDI Mix: faders CC61–69; banks Note25/26; "
+                             "MUTE CC31–38; REC CC51–58; SOLO+MUTE CC41–48; "
+                             "knobs CC1–8/11–18/71–78 (2026 preset)")
+
+        try:
+            mix_dest = M.find_endpoint("dest")
+        except SystemExit:
+            self.log("real 'MIDI Mix' output is not present — panel lamps are unavailable")
+        else:
+            err = M._cm.MIDIOutputPortCreate(
+                self.client, M._cfstr("MIDI Mix out"), ctypes.byref(self.mix_output))
+            if err:
+                self.log(f"could not open MIDI Mix output ({err}) — no LED feedback")
+            else:
+                self.mix_dest = mix_dest
+                self.mix_out_ok = True
+                self.log("MIDI Mix output open — Logic mute/solo/rec LEDs → panel")
 
         self.log(f"virtual surface up: {name!r}  (announcing as Logic Control 0x10)")
         self.log("delete any Control Surface that still points at the real 'MIDI Mix'")
@@ -360,12 +502,30 @@ class VirtualMCU:
             tag = f"  ({note})" if note else ""
             self.log(f"→ host  {msg.hex(' ')}{tag}")
 
+    def send_to_mix(self, msg: bytes, note: str = "", log: bool = False):
+        """Host → physical MIDI Mix (panel LED feedback)."""
+        if not self.mix_out_ok or self.mix_dest is None:
+            return
+        err = M._cm.MIDISend(self.mix_output, self.mix_dest, M._packet_list(msg))
+        if err:
+            self.log(f"MIDISend to MIDI Mix failed ({err}): {msg.hex(' ')}")
+            return
+        if log or not self.quiet:
+            tag = f"  ({note})" if note else ""
+            self.log(f"→ mix   {msg.hex(' ')}{tag}")
+
     def emit_fixed_master(self, value_7bit: int):
         """Send the stable, learnable master CC on its own virtual MIDI port."""
-        msg = bytes([FIXED_MASTER_STATUS, FIXED_MASTER_CC, value_7bit])
+        self.emit_fixed_cc(FIXED_MASTER_CC, value_7bit, label="fixed-master")
+
+    def emit_fixed_cc(self, cc: int, value_7bit: int, label: str = "fixed"):
+        """Emit an absolute CC on the stable, learnable ``MIDI Mix Fixed`` port."""
+        if not 0 <= cc <= 127 or not 0 <= value_7bit <= 127:
+            raise ValueError("fixed CC and value must both be 0..127")
+        msg = bytes([FIXED_MASTER_STATUS, cc, value_7bit])
         err = M._cm.MIDIReceived(self.fixed_source, M._packet_list(msg))
         if err:
-            self.log(f"fixed-master MIDIReceived failed ({err}): {msg.hex(' ')}")
+            self.log(f"{label} MIDIReceived failed ({err}): {msg.hex(' ')}")
 
     def send_connection_query(self, device_id: int = None, new_challenge: bool = True,
                               clear_connected: bool = False):
@@ -389,71 +549,22 @@ class VirtualMCU:
         while time.monotonic() < end:
             M._pump(0.02)
 
-    def send_fader(self, strip: int, value_7bit: int, hold_ms: int = 80):
-        """Drive one MCU fader. Watch the *volume* fader in Logic's mixer.
-
-        MCU encodes fader position as Pitch Bend on MIDI channel = strip.
-        That is wire format only — Logic maps it to channel strip volume,
-        not to track pitch-bend automation.
-        """
-        label = "MASTER" if strip == 9 else f"strip {strip}"
-        before = self.host_faders.get(strip)
-
-        # Touch down and hold for the whole move (Logic sent touchless=0).
-        if not self.touchless:
-            for m in fader_touch(strip, True):
-                self.emit(m, f"touch {label} DOWN")
-            self._pump_ms(30)
-
-        # Ramp so the move is obvious even if Logic samples sparsely.
-        start = int(round((before or 0.0) * 127)) if before is not None else 0
-        steps = max(abs(value_7bit - start), 1)
-        n = min(steps, 8)
-        for i in range(1, n + 1):
-            v = start + (value_7bit - start) * i // n
-            self.emit(fader_pitch_bend(strip, v),
-                      f"fader {label} = {v}/127  (MCU pitch-bend ch{strip})")
-            self._pump_ms(15)
-
-        self._pump_ms(hold_ms)
-
-        if not self.touchless:
-            for m in fader_touch(strip, False):
-                self.emit(m, f"touch {label} UP")
-            self._pump_ms(30)
-
-        after = self.host_faders.get(strip)
-        if after is not None:
-            self.log(f"  Logic fader-fb strip {strip}: "
-                     f"before={before!s} after={after:.3f} "
-                     f"(target≈{value_7bit / 127:.3f})")
-        else:
-            self.log(f"  (no fader-fb from Logic yet for strip {strip})")
-
-    def send_fader_test(self, strip: int = 1):
-        """Dramatic 0 → 127 → 64 so a volume move is hard to miss."""
-        self.log(f"*** FADER TEST strip {strip}: watch VOLUME fader in Logic mixer ***")
-        self.log("    (not pitch bend — MCU uses pitch-bend bytes to mean volume)")
-        self.send_fader(strip, 0, hold_ms=100)
-        self.send_fader(strip, 127, hold_ms=200)
-        self.send_fader(strip, 64, hold_ms=100)
-        self.log("*** FADER TEST done — did the volume fader jump? ***")
-
-    def sweep_faders(self):
-        self.log("sweeping all 9 faders 0 → 127 → 0 …")
-        for strip in range(1, 10):
-            for v in (0, 64, 127, 0):
-                self.send_fader(strip, v, hold_ms=40)
-
     def send_bank(self, direction: str, count: int = 1):
         """Ask Logic to move the MCU eight-strip bank left or right."""
         note = {"left": MCU_BANK_LEFT_NOTE, "right": MCU_BANK_RIGHT_NOTE}.get(direction)
         if note is None or count < 1:
             raise ValueError("usage: bank <left|right|home> [count]")
+        self._logic_led_state.clear()
+        for strip in range(1, 9):
+            for kind in ("mute", "solo", "rec"):
+                hw = hardware_led_note(kind, strip)
+                if hw is not None:
+                    self.send_to_mix(bytes([0x90, hw, 0]), log=False)
         for _ in range(count):
             for msg in mcu_button_press(note):
                 self.emit(msg, f"bank {direction}")
             self._pump_ms(30)
+        self._reset_soft_takeover()
         self.log(f"banked {direction} ×{count}")
 
     def send_bank_home(self):
@@ -466,78 +577,280 @@ class VirtualMCU:
                               sorted(self._mix_last_value.items())) or "none"
         mix = (f"MIDI Mix faders={self._mix_msg_count} last=[{mix_values}]"
                if self.mix_connected else "MIDI Mix not connected")
-        master = f"master-route={self.master_route}"
+        takeover = "soft" if self.soft_takeover_enabled else "absolute"
+        knobs = self._knob_layout
+        common = f"{mix}  master=fixed  faders={takeover}  knobs={knobs}"
         if self.connected:
             return (f"CONNECTED as 0x{self.connected_id:02X}  "
-                    f"host msgs={self.host_msg_count}  {mix}  {master}  touchless={self.touchless}")
+                    f"host msgs={self.host_msg_count}  {common}")
         if self.host_msg_count > 0:
-            # Logic often streams LCD/meters before (or without) a formal
-            # Host Connection Reply — still online enough to move faders.
             return (f"ONLINE (no formal handshake yet)  "
                     f"host msgs={self.host_msg_count}  "
-                    f"fader-fb strips={sorted(self.host_faders)}  "
-                    f"{mix}  {master}  touchless={self.touchless}")
-        return ("WAITING for Logic  host msgs=0  "
-                f"{mix}  {master}  (Logic Output port is not our dest)")
+                    f"fader-fb strips={sorted(self.host_faders)}  {common}")
+        return f"WAITING for Logic  host msgs=0  {common}"
 
     # -- from Logic --------------------------------------------------------
 
     def _dest_callback(self, pkt_list, _src, _ref):
+        """CoreMIDI callback: copy packets only; main loop owns bridge state."""
         try:
             for msg in M._iter_packets(pkt_list):
-                if msg:
-                    self._handle_from_host(msg)
+                if msg and not self._closing:
+                    self._incoming.put(("host", time.monotonic(), bytes(msg)))
         except Exception as exc:  # noqa: BLE001
             self.log(f"callback error: {exc!r}")
 
     def _mix_callback(self, pkt_list, _src, _ref):
-        """Translate faders and the collision-free fixed bank buttons."""
+        """CoreMIDI callback: copy packets only; main loop owns bridge state."""
         try:
             for msg in M._iter_packets(pkt_list):
-                # Keep these two raw diagnostics visible while bringing the
-                # physical buttons online.  They are low-rate and make it
-                # immediately clear whether the bridge saw the press.
-                if len(msg) >= 3 and msg[1] in MGB_BANK_BUTTON_NOTES:
-                    self.log(f"← MIDI Mix  {msg.hex(' ')}  [bank candidate]")
-                event = parse_mgb_fader(msg)
-                if event is not None:
-                    self.forward_midi_mix_fader(*event)
-                    continue
-                bank = parse_mgb_bank_button(msg)
-                if bank is not None:
-                    direction, pressed = bank
-                    # A full MCU press/release is emitted on the physical
-                    # press. The MIDI Mix release CC is only confirmation.
-                    if pressed:
-                        self.send_bank(direction)
+                if msg and not self._closing:
+                    self._incoming.put(("mix", time.monotonic(), bytes(msg)))
         except Exception as exc:  # noqa: BLE001
             self.log(f"MIDI Mix callback error: {exc!r}")
 
-    def forward_midi_mix_fader(self, strip: int, value_7bit: int):
-        """Forward a physical fader and hold MCU touch while it is in motion.
+    def service_incoming(self):
+        """Drain copied CoreMIDI messages on the main thread."""
+        while True:
+            try:
+                origin, received_at, msg = self._incoming.get_nowait()
+            except queue.Empty:
+                break
+            if origin == "host":
+                self._handle_from_host(msg)
+            else:
+                self._handle_from_mix(received_at, msg)
+        self._flush_send_all_pending(time.monotonic())
 
-        This is direct absolute control for Phase 2. Soft takeover needs Logic
-        feedback plus a crossing detector and is intentionally deferred to the
-        next phase rather than guessed at here.
+    def _flush_send_all_pending(self, now: float, force: bool = False):
+        if not self._send_all_pending:
+            return
+        first_at = self._send_all_pending[0][0]
+        if not force and now - first_at < SEND_ALL_WINDOW_SECS:
+            return
+        pending, self._send_all_pending = self._send_all_pending, []
+        for _received_at, msg in pending:
+            self._route_mix_message(msg)
+
+    def _handle_from_mix(self, received_at: float, msg: bytes):
+        """Coalesce SEND ALL's known snapshot before routing physical input."""
+        is_candidate = (
+            len(msg) >= 3
+            and msg[0] == 0xB0
+            and msg[1] in SEND_ALL_BURST_CCS
+        )
+        if not is_candidate:
+            self._flush_send_all_pending(received_at, force=True)
+            self._route_mix_message(msg)
+            return
+
+        if self._send_all_pending:
+            first_at = self._send_all_pending[0][0]
+            seen = {pending[1][1] for pending in self._send_all_pending}
+            if (received_at - first_at > SEND_ALL_WINDOW_SECS
+                    or msg[1] in seen):
+                self._flush_send_all_pending(received_at, force=True)
+
+        self._send_all_pending.append((received_at, msg))
+        seen = {pending[1][1] for pending in self._send_all_pending}
+        if seen == SEND_ALL_BURST_CCS:
+            # Preserve absolute knob baselines, but never forward the snapshot.
+            for _stamp, pending in self._send_all_pending:
+                knob = parse_mgb_knob(pending)
+                if knob is not None:
+                    row, strip, value = knob
+                    self._knob_last[(row, strip)] = value
+            self._send_all_pending.clear()
+            self.log("SEND ALL snapshot ignored (protected knobs and fixed Master)")
+
+    def _route_mix_message(self, msg: bytes):
+        """Translate one physical MIDI Mix message."""
+        if len(msg) >= 3 and msg[1] in MGB_BANK_BUTTON_NOTES:
+            self.log(f"← MIDI Mix  {msg.hex(' ')}  [bank]")
+        event = parse_mgb_fader(msg)
+        if event is not None:
+            self.forward_midi_mix_fader(*event)
+            return
+        bank = parse_mgb_bank_button(msg)
+        if bank is not None:
+            direction, pressed = bank
+            if pressed:
+                self.send_bank(direction)
+            return
+        btn = parse_mgb_channel_button(msg)
+        if btn is not None:
+            self.forward_channel_button(*btn)
+            return
+        knob = parse_mgb_knob(msg)
+        if knob is not None:
+            self.forward_knob(*knob)
+            return
+        # Firmware SOLO key (Note 27): rising edge toggles software solo mode.
+        if (len(msg) >= 3 and (msg[0] & 0x0F) == 0
+                and msg[1] == MGB_SOLO_BUTTON_NOTE
+                and (msg[0] & 0xF0) in (0x90, 0x80)):
+            pressed = (msg[0] & 0xF0) == 0x90 and msg[2] != 0
+            self.handle_solo_key(pressed)
+
+    def handle_solo_key(self, pressed: bool):
+        """SOLO Note 27: latch on press (toggle), ignore auto-repeat while held."""
+        if pressed and not self._solo_key_down:
+            self.solo_mode_latched = not self.solo_mode_latched
+            state = "ON" if self.solo_mode_latched else "OFF"
+            self.log(f"*** SOLO mode {state} (tap toggle) — "
+                     f"MUTE buttons now send "
+                     f"{'SOLO' if self.solo_mode_latched else 'MUTE'} ***")
+            # A press can straddle a layer change; forget edge state so its
+            # eventual release cannot suppress the next valid press.
+            self._btn_state.clear()
+            self._refresh_solo_mode_leds()
+        self._solo_key_down = pressed
+
+    def _refresh_solo_mode_leds(self):
+        """Clear both panel layers, then repaint Logic's cached state."""
+        for strip in range(1, 9):
+            for kind in ("mute", "solo"):
+                hw = hardware_led_note(kind, strip)
+                if hw is not None:
+                    self.send_to_mix(bytes([0x90, hw, 0]), log=False)
+        for strip in range(1, 9):
+            if self.solo_mode_latched:
+                self._paint_led_to_mix(
+                    "solo", strip, self._logic_led_state.get(("solo", strip), False))
+            else:
+                self._paint_led_to_mix(
+                    "mute", strip, self._logic_led_state.get(("mute", strip), False))
+                self._paint_led_to_mix(
+                    "solo", strip, self._logic_led_state.get(("solo", strip), False))
+
+    def forward_channel_button(self, kind: str, strip: int, pressed: bool):
+        """MUTE / REC / SOLO-layer CC → MCU channel-strip button notes.
+
+        When software SOLO mode is latched, physical MUTE CCs are treated as
+        SOLO (so you need not hold the SOLO key). Hardware SOLO+MUTE layer CCs
+        (41–48) always map to solo regardless.
         """
-        # The fixed port is always emitted. Until the user creates the one-time
-        # Logic assignment it is harmless; the temporary MCU mirror below keeps
-        # MASTER usable through the current mirror in the pre-assignment layout.
+        effective = "solo" if (kind == "mute" and self.solo_mode_latched) else kind
+        # Edge-detect on the *incoming* control (mute vs solo-layer CC vs rec).
+        key_in = (kind, strip)
+        prev = self._btn_state.get(key_in)
+        if prev is pressed:
+            return
+        self._btn_state[key_in] = pressed
+
+        note = mcu_channel_button_note(effective, strip)
+        label = f"{effective} strip {strip}"
+        if effective != kind:
+            label += " (MUTE key, solo mode)"
+        if pressed:
+            self.emit(bytes([0x90, note, 127]), f"{label} down")
+        else:
+            self.emit(bytes([0x90, note, 0]), f"{label} up", log=False)
+            self.emit(bytes([0x80, note, 0]), f"{label} up")
+
+    def forward_led_to_mix(self, kind: str, strip: int, on: bool):
+        """Logic MCU LED note → physical MIDI Mix lamp (base-3 map).
+
+        In software SOLO mode, solo state is painted on the *mute* lamp notes
+        so the mute-row LEDs show solo without holding SOLO. Mute LEDs are
+        suppressed in that mode so the two don't fight over the same lamps.
+        """
+        self._logic_led_state[(kind, strip)] = on
+        self._paint_led_to_mix(kind, strip, on)
+
+    def _paint_led_to_mix(self, kind: str, strip: int, on: bool):
+        paint_kind = kind
+        if self.solo_mode_latched:
+            if kind == "mute":
+                return
+            if kind == "solo":
+                paint_kind = "mute"  # solo status → mute-row lamps
+        hw = hardware_led_note(paint_kind, strip)
+        if hw is None:
+            return
+        vel = 127 if on else 0
+        self.send_to_mix(bytes([0x90, hw, vel]),
+                         f"LED {kind} {strip} → note {hw} "
+                         f"{'on' if on else 'off'}"
+                         + (" [solo mode→mute lamp]" if paint_kind != kind else ""),
+                         log=not self.quiet)
+
+    def _reset_soft_takeover(self):
+        """Re-engage soft takeover on all faders (call after bank change)."""
+        if self._soft_takeover:
+            self.log("soft-takeover reset (bank changed)")
+        self._soft_takeover.clear()
+
+    def set_knob_layout(self, layout: str, save: bool = False):
+        if layout not in KNOB_LAYOUTS:
+            raise ValueError(f"unknown knob layout {layout!r}")
+        self._knob_layout = layout
+        self._knob_last.clear()
+        if save:
+            with open(KNOB_LAYOUT_PATH, "w") as fh:
+                fh.write(layout + "\n")
+
+    def forward_knob(self, row: int, strip: int, value: int):
+        """Route a physical knob according to the selected knob layout."""
+        if self._knob_layout == "disabled":
+            return
+
+        if self._knob_layout == "fixed":
+            # Separate absolute addresses let Logic learn any selected parameter.
+            # They deliberately remain tied to that learned target; Controller
+            # Assignments do not follow the MCU fader bank.
+            self.emit_fixed_cc(KNOB_FIXED_CC[(row, strip)], value,
+                               label=f"fixed knob row {row} strip {strip}")
+            return
+
+        if self._knob_layout == "vpot" and row != 1:
+            # A real Mackie Control has eight V-Pots. Keeping just the top
+            # physical row live makes this manual compatibility mode legible.
+            return
+
+        # V-Pot mode preserves a manually selected shared MCU parameter.
+        key = (row, strip)
+        prev = self._knob_last.get(key)
+        self._knob_last[key] = value
+        if prev is None:
+            return
+        delta = value - prev
+        for msg in vpot_relative(strip, delta):
+            self.emit(msg, log=False)
+
+    def forward_midi_mix_fader(self, strip: int, value_7bit: int):
+        """Forward a physical fader with optional soft takeover."""
         if strip == 9:
             self.emit_fixed_master(value_7bit)
-            if self.master_route == "fixed":
-                self._mix_msg_count += 1
-                self._mix_last_value[strip] = value_7bit
-                return
-        target_strip = PHYSICAL_MASTER_TARGET_STRIP if strip == 9 else strip
-        with self._lock:
-            if not self.touchless and target_strip not in self._mix_touches:
-                for msg in fader_touch(target_strip, True):
-                    self.emit(msg, f"MIDI Mix fader {strip} touch DOWN", log=False)
-            self.emit(fader_pitch_bend(target_strip, value_7bit), log=False)
-            self._mix_touches[target_strip] = time.monotonic() + FADER_TOUCH_RELEASE_SECS
             self._mix_msg_count += 1
             self._mix_last_value[strip] = value_7bit
+            return
+        target_strip = strip
+
+        if self.soft_takeover_enabled and strip != 9:
+            host_val = self.host_faders.get(target_strip)
+            if host_val is not None:
+                host_7bit = int(round(host_val * 127))
+                prev = self._phys_fader_last.get(strip)
+                if not self._soft_takeover.get(strip):
+                    if _crosses(prev, value_7bit, host_7bit):
+                        self._soft_takeover[strip] = True
+                        self.log(f"soft-takeover strip {strip}: caught at {value_7bit}")
+                    else:
+                        self._phys_fader_last[strip] = value_7bit
+                        self._mix_msg_count += 1
+                        self._mix_last_value[strip] = value_7bit
+                        return
+
+        self._phys_fader_last[strip] = value_7bit
+        if not self.touchless and target_strip not in self._mix_touches:
+            for msg in fader_touch(target_strip, True):
+                self.emit(msg, f"MIDI Mix fader {strip} touch DOWN", log=False)
+        self.emit(fader_pitch_bend(target_strip, value_7bit), log=False)
+        self._phys_fader_sent_at[strip] = time.monotonic()
+        self._mix_touches[target_strip] = time.monotonic() + FADER_TOUCH_RELEASE_SECS
+        self._mix_msg_count += 1
+        self._mix_last_value[strip] = value_7bit
 
     def release_idle_midi_mix_touches(self):
         """Release touch after the physical fader has been still briefly."""
@@ -545,12 +858,11 @@ class VirtualMCU:
             self._mix_touches.clear()
             return
         now = time.monotonic()
-        with self._lock:
-            idle = [strip for strip, deadline in self._mix_touches.items() if deadline <= now]
-            for strip in idle:
-                for msg in fader_touch(strip, False):
-                    self.emit(msg, f"MIDI Mix fader {strip} touch UP", log=False)
-                del self._mix_touches[strip]
+        idle = [strip for strip, deadline in self._mix_touches.items() if deadline <= now]
+        for strip in idle:
+            for msg in fader_touch(strip, False):
+                self.emit(msg, f"MIDI Mix fader {strip} touch UP", log=False)
+            del self._mix_touches[strip]
 
     def _handle_from_host(self, msg: bytes):
         self.host_msg_count += 1
@@ -569,11 +881,32 @@ class VirtualMCU:
                 strip = (msg[0] & 0x0F) + 1
                 if 1 <= strip <= 9:
                     pb = msg[1] | (msg[2] << 7)
-                    self.host_faders[strip] = pb / 16383.0
+                    new_value = pb / 16383.0
+                    previous = self.host_faders.get(strip)
+                    self.host_faders[strip] = new_value
+                    recently_sent = (
+                        time.monotonic() - self._phys_fader_sent_at.get(strip, 0.0)
+                        < FADER_TOUCH_RELEASE_SECS + 0.15
+                    )
+                    changed_elsewhere = (
+                        previous is not None
+                        and abs(new_value - previous) * 127 > SOFT_TAKEOVER_TOLERANCE
+                        and not recently_sent
+                    )
+                    if (strip <= 8 and self.soft_takeover_enabled
+                            and self._soft_takeover.get(strip)
+                            and changed_elsewhere):
+                        self._soft_takeover.pop(strip, None)
+                        self.log(f"soft-takeover strip {strip}: Logic value changed")
+                if self.quiet:
+                    return
+            # Logic → MCU LED notes → physical panel (base-3 map)
+            led = parse_mcu_led_note(msg)
+            if led is not None:
+                self.forward_led_to_mix(*led)
                 if self.quiet:
                     return
             if self.quiet and kind in (0x90, 0x80, 0xB0):
-                # LED notes + timecode/v-pot CCs: keep quiet after online
                 return
             label = {0xE0: "pitchbend/fader-fb", 0x90: "note", 0x80: "note-off",
                      0xB0: "cc"}.get(kind, "other")
@@ -653,6 +986,14 @@ class VirtualMCU:
                 self.log(f"  unhandled Mackie cmd 0x{cmd:02X}")
 
     def close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._send_all_pending.clear()
+        for strip in list(self._mix_touches):
+            for msg in fader_touch(strip, False):
+                self.emit(msg, f"MIDI Mix fader {strip} touch UP", log=False)
+        self._mix_touches.clear()
         try:
             M._cm.MIDIEndpointDispose(self.source)
             M._cm.MIDIEndpointDispose(self.fixed_source)
@@ -667,78 +1008,42 @@ class VirtualMCU:
 # commands
 # --------------------------------------------------------------------------
 
-def _drain_cmd_file(surface: VirtualMCU, stop: list):
-    """Read lines from .mcu_cmd (written by a second terminal) and run them."""
-    if not os.path.exists(CMD_PATH):
-        return
-    try:
-        with open(CMD_PATH) as fh:
-            lines = fh.read().splitlines()
-        os.remove(CMD_PATH)
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if line:
-            surface.log(f"(cmd file) {line}")
-            _handle_cli(surface, line, stop)
-
-
 def cmd_run():
-    _acquire_pid_lock()
-    # Clear stale command file
-    try:
-        if os.path.exists(CMD_PATH):
-            os.remove(CMD_PATH)
-    except OSError:
-        pass
-
-    surface = VirtualMCU()
-    surface.send_connection_query(new_challenge=True, clear_connected=True)
-
-    print()
-    print("=" * 64)
-    print("  Phase 1 probe running  (ONE instance only)")
-    print(f"  Ports: Input = {PORT_NAME!r}   Output = {PORT_NAME!r}")
-    print()
-    print("  Logic checklist:")
-    print("    1. Delete any surface still using the real 'MIDI Mix' ports")
-    print("    2. Install → Mackie Designs → Mackie Control → Add")
-    print(f"    3. Input + Output both = {PORT_NAME!r}")
-    print("    4. Close the Setup window")
-    print("    5. Wait until this log shows HANDSHAKE OK / LCD track names")
-    print("    6. Move a physical MIDI Mix fader (mgb70 preset: ch1 CC61–69),")
-    print("       or drive a synthetic fader here / from another terminal:")
-    print(f"         echo 'f 1 100' > {_ROOT}/.mcu_cmd")
-    print(f"  Fixed master port: {FIXED_PORT_NAME!r} sends ch16 CC{FIXED_MASTER_CC}")
-    print()
-    print("  Logic handshake and synthetic fader testing were verified in Phase 1.")
-    print("  This mixer route never moves a Logic fader by itself: it responds only")
-    print("  to physical MIDI Mix movement or an explicit test command.")
-    print()
-    print("  Phase 2 is direct absolute fader control; soft takeover comes next.")
-    print("  Physical BANK LEFT/RIGHT use fixed ch1 Note25/26 (mgb70 preset).")
-    print("  commands: f <1-9> <0-127> | bank <left|right|home> [count]")
-    print("            | master <mirror|fixed> | sweep | ping | status | q")
-    print("=" * 64)
-    print()
-    print(f"  {surface.status_line()}")
-    print()
-
     import signal
-    stop = []
-    last_announce = time.monotonic()
-    last_status = time.monotonic()
+    lock_file = _acquire_pid_lock()
+    stop = threading.Event()
+    surface = None
+    previous_handlers = {}
 
     def _sig(*_):
-        stop.append(True)
+        stop.set()
 
-    prev = signal.signal(signal.SIGINT, _sig)
     try:
-        while not stop:
-            M._pump(0.1)
+        surface = VirtualMCU()
+        surface.send_connection_query(new_challenge=True, clear_connected=True)
+
+        fader_mode = "soft-takeover" if surface.soft_takeover_enabled else "absolute"
+        print()
+        print("MIDI Mix → Logic mixer bridge is running.")
+        print(f"Faders ({fader_mode}), knobs ({surface._knob_layout}),")
+        print("fixed Master, BANK, MUTE, REC, SOLO, and panel lamps are active.")
+        print("Keep this window open while mixing; type q here when finished.")
+        print(f"Logic surface: Input + Output = {PORT_NAME!r}")
+        print("If this is a new Logic setup, see README.md for the one-time configuration.")
+        print("Commands: status | solo | takeover | knobs | bank home | q")
+        print()
+        print(f"  {surface.status_line()}")
+        print()
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[sig] = signal.signal(sig, _sig)
+
+        last_announce = time.monotonic()
+        last_status = time.monotonic()
+        while not stop.is_set():
+            M._pump(0.02)
+            surface.service_incoming()
             now = time.monotonic()
-            _drain_cmd_file(surface, stop)
             surface.release_idle_midi_mix_touches()
 
             # Re-announce every 5s until we have seen host traffic.
@@ -758,25 +1063,76 @@ def cmd_run():
                         break
                     _handle_cli(surface, line.strip(), stop)
     finally:
-        signal.signal(signal.SIGINT, prev)
-        surface.close()
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+        if surface is not None:
+            surface.close()
+        lock_file.close()
     return 0
 
 
-def _handle_cli(surface: VirtualMCU, line: str, stop: list):
+def _print_fixed_knob_learn_help():
+    """Print the exact fixed-port assignments without blocking the MIDI loop."""
+    print("\n  Fixed custom-knob setup (one-time, global Logic assignments)")
+    print("  1. In Logic, click the exact parameter you want this knob to control.")
+    print("  2. Choose Control Surfaces → Learn Assignment for Selected Parameter.")
+    print("  3. Back here, type the matching command below. It emits MIDI Mix Fixed ch16.")
+    print("     The physical knob can be moved instead, but these commands make the")
+    print("     captured address explicit and avoid accidentally learning a fader.")
+    print("\n  Master:  learn master       (CC119; already learned if MASTER works)")
+    print("  Knobs:   learn <row> <strip>  (row 1-3; strip 1-8)")
+    print("\n  Example: click the desired Track 4 parameter in Logic, arm Learn, then:")
+    print("           learn 2 4           (emits ch16 CC14 at a middle value)\n")
+
+
+def _emit_fixed_learn_value(surface: VirtualMCU, target: str, row: int = None,
+                            strip: int = None):
+    """Send a deterministic middle value for one Logic Learn capture."""
+    if target == "master":
+        surface.emit_fixed_master(64)
+        print("  emitted MIDI Mix Fixed ch16 CC119 = 64 for Logic Learn")
+        return
+    cc = KNOB_FIXED_CC[(row, strip)]
+    surface.emit_fixed_cc(cc, 64, label=f"learn row {row} strip {strip}")
+    print(f"  emitted MIDI Mix Fixed ch16 CC{cc} = 64 "
+          f"for row {row}, strip {strip} Learn")
+
+
+def _handle_cli(surface: VirtualMCU, line: str, stop: threading.Event):
     if not line:
         return
     parts = line.split()
     cmd = parts[0].lower()
 
     if cmd in ("q", "quit", "exit"):
-        stop.append(True)
+        stop.set()
         return
     if cmd == "ping":
         surface.send_connection_query(new_challenge=True, clear_connected=False)
         return
     if cmd == "status":
-        print(f"  {surface.status_line()}  meters={surface._meter_count}")
+        solo = "ON" if surface.solo_mode_latched else "OFF"
+        takeover = "soft" if surface.soft_takeover_enabled else "absolute"
+        print(f"  {surface.status_line()}")
+        print(f"  solo_mode={solo}  meters={surface._meter_count}  "
+              f"faders={takeover}  knobs={surface._knob_layout}")
+        return
+    if cmd == "solo":
+        # solo | solo on | solo off | solo toggle
+        arg = parts[1].lower() if len(parts) > 1 else "toggle"
+        if arg in ("toggle", "t"):
+            surface.solo_mode_latched = not surface.solo_mode_latched
+        elif arg in ("on", "1", "true"):
+            surface.solo_mode_latched = True
+        elif arg in ("off", "0", "false"):
+            surface.solo_mode_latched = False
+        else:
+            print("  usage: solo [on|off|toggle]")
+            return
+        surface._btn_state.clear()
+        surface._refresh_solo_mode_leds()
+        print(f"  solo mode → {'ON' if surface.solo_mode_latched else 'OFF'} "
+              f"(MUTE keys send {'SOLO' if surface.solo_mode_latched else 'MUTE'})")
         return
     if cmd == "quiet":
         surface.quiet = True
@@ -786,42 +1142,77 @@ def _handle_cli(surface: VirtualMCU, line: str, stop: list):
         surface.quiet = False
         print("  quiet off (full log)")
         return
-    if cmd == "sweep":
-        surface.sweep_faders()
-        return
     if cmd == "bank":
         direction = parts[1].lower() if len(parts) > 1 else ""
-        try:
-            if direction == "home":
-                surface.send_bank_home()
-            else:
-                count = int(parts[2]) if len(parts) > 2 else 1
-                surface.send_bank(direction, count)
-        except ValueError as exc:
-            print(f"  {exc}")
-        return
-    if cmd == "master" and len(parts) == 2:
-        route = parts[1].lower()
-        if route not in ("mirror", "fixed"):
-            print("  usage: master <mirror|fixed>")
+        if direction == "home" and len(parts) == 2:
+            surface.send_bank_home()
         else:
-            surface.master_route = route
-            print(f"  physical MASTER route → {route}")
+            print("  usage: bank home")
         return
-    if cmd in ("f", "fader") and len(parts) >= 3:
+    if cmd == "takeover":
+        arg = parts[1].lower() if len(parts) > 1 else "toggle"
+        if arg in ("toggle", "t"):
+            surface.soft_takeover_enabled = not surface.soft_takeover_enabled
+        elif arg in ("on", "1"):
+            surface.soft_takeover_enabled = True
+        elif arg in ("off", "0"):
+            surface.soft_takeover_enabled = False
+            surface._soft_takeover.clear()
+        else:
+            print("  usage: takeover [on|off|toggle]")
+            return
+        state = "ON" if surface.soft_takeover_enabled else "OFF (absolute)"
+        print(f"  soft-takeover → {state}")
         try:
-            surface.send_fader(int(parts[1]), int(parts[2]))
-        except ValueError as exc:
-            print(f"  usage: f <strip 1-9> <0-127>   ({exc})")
+            with open(SOFT_TAKEOVER_PATH, "w") as fh:
+                fh.write("on\n" if surface.soft_takeover_enabled else "off\n")
+        except OSError as exc:
+            print(f"  warning: setting changed for this run but was not saved: {exc}")
         return
-    if cmd == "test":
-        strip = int(parts[1]) if len(parts) > 1 else 1
-        surface.send_fader_test(strip)
+    if cmd == "knobs":
+        arg = parts[1].lower() if len(parts) > 1 else ""
+        if arg in KNOB_LAYOUTS:
+            saved = True
+            try:
+                surface.set_knob_layout(arg, save=True)
+            except OSError as exc:
+                saved = False
+                surface.set_knob_layout(arg, save=False)
+                print(f"  warning: layout changed for this run but was not saved: {exc}")
+            meaning = {
+                "fixed": "24 stable custom-learn CCs through MIDI Mix Fixed (nonbanked)",
+                "vpot": "one native MCU parameter across the current bank (no learns)",
+                "disabled": "knobs off",
+            }[arg]
+            scope = "saved" if saved else "this run only"
+            print(f"  knob layout → {arg} ({scope}): {meaning}")
+        else:
+            print(f"  layout: {surface._knob_layout}")
+            print(f"  knobs <{'|'.join(KNOB_LAYOUTS)}>  — choose layout")
+        return
+    if cmd == "learn":
+        if len(parts) == 1:
+            _print_fixed_knob_learn_help()
+            return
+        if len(parts) == 2 and parts[1].lower() == "master":
+            _emit_fixed_learn_value(surface, "master")
+            return
+        if len(parts) == 3:
+            try:
+                row, strip = int(parts[1]), int(parts[2])
+                if not (1 <= row <= 3 and 1 <= strip <= 8):
+                    raise ValueError
+            except ValueError:
+                print("  usage: learn <row 1-3> <strip 1-8>  |  learn master")
+                return
+            _emit_fixed_learn_value(surface, "knob", row, strip)
+            return
+        print("  usage: learn [master | <row 1-3> <strip 1-8>]")
         return
     if cmd == "help":
-        print("  f <strip 1-9> <0-127> | test [strip] | sweep | bank <left|right|home> [count]")
-        print("  master <mirror|fixed> | ping | status | quiet | verbose | q")
-        print("  (fader = volume in Logic mixer; MCU wires it as pitch-bend)")
+        print("  status | solo [on|off|toggle] | takeover [on|off|toggle]")
+        print(f"  knobs [{'|'.join(KNOB_LAYOUTS)}] | learn [master|<row> <strip>]")
+        print("  bank home | ping | quiet | verbose | q")
         return
     print(f"  unknown command {line!r}  (try: help)")
 
@@ -871,39 +1262,100 @@ def cmd_selfcheck():
     check("fixed master uses isolated CC119", (FIXED_MASTER_STATUS, FIXED_MASTER_CC) ==
           (0xBF, 119))
 
-    print("\nvirtual port creation")
-    try:
-        s = VirtualMCU(name="MIDI Mix MCU selfcheck")
-        names_src = [M._obj_name(M._cm.MIDIGetSource(i))
-                     for i in range(M._cm.MIDIGetNumberOfSources())]
-        names_dst = [M._obj_name(M._cm.MIDIGetDestination(i))
-                     for i in range(M._cm.MIDIGetNumberOfDestinations())]
-        check("source visible", "MIDI Mix MCU selfcheck" in names_src)
-        check("dest visible", "MIDI Mix MCU selfcheck" in names_dst)
-        s.send_connection_query()
-        s.send_fader(1, 100)
-        M._pump(0.2)
-        s.close()
-        check("create/emit/close", True)
-    except SystemExit as exc:
-        check("create/emit/close", False, str(exc))
+    print("\nchannel buttons + LED map")
+    check("MUTE1 CC31 down", parse_mgb_channel_button(bytes([0xB0, 31, 127])) ==
+          ("mute", 1, True))
+    check("MUTE8 CC38 up", parse_mgb_channel_button(bytes([0xB0, 38, 0])) ==
+          ("mute", 8, False))
+    check("REC3 CC53 down", parse_mgb_channel_button(bytes([0xB0, 53, 127])) ==
+          ("rec", 3, True))
+    check("SOLO+MUTE layer strip2", parse_mgb_channel_button(bytes([0xB0, 42, 127])) ==
+          ("solo", 2, True))
+    check("knob not a channel button", parse_mgb_channel_button(bytes([0xB0, 1, 64])) is None)
+    check("MCU mute strip1 note 16", mcu_channel_button_note("mute", 1) == 16)
+    check("MCU solo strip8 note 15", mcu_channel_button_note("solo", 8) == 15)
+    check("MCU rec strip1 note 0", mcu_channel_button_note("rec", 1) == 0)
+    check("LED mute1 note 1", hardware_led_note("mute", 1) == 1)
+    check("LED solo3 note 8", hardware_led_note("solo", 3) == 8)
+    check("LED rec7 note 21", hardware_led_note("rec", 7) == 21)
+    check("LED rec8 is note 24 (base-3 extension)", hardware_led_note("rec", 8) == 24)
+    check("parse MCU LED mute3 on", parse_mcu_led_note(bytes([0x90, 18, 127])) ==
+          ("mute", 3, True))
+    check("parse MCU LED rec1 off", parse_mcu_led_note(bytes([0x80, 0, 0])) ==
+          ("rec", 1, False))
+
+    print("\nknob parsing + V-Pot encoding")
+    check("row1 CC1 strip1", parse_mgb_knob(bytes([0xB0, 1, 64])) == (1, 1, 64))
+    check("row2 CC18 strip8", parse_mgb_knob(bytes([0xB0, 18, 100])) == (2, 8, 100))
+    check("row3 CC71 strip1", parse_mgb_knob(bytes([0xB0, 71, 0])) == (3, 1, 0))
+    check("row3 CC78 strip8", parse_mgb_knob(bytes([0xB0, 78, 127])) == (3, 8, 127))
+    check("fader CC not a knob", parse_mgb_knob(bytes([0xB0, 61, 64])) is None)
+    check("vpot cw +3 uses three safe ticks",
+          vpot_relative(1, 3) == [bytes([0xB0, 0x10, 0x01])] * 3)
+    check("vpot ccw is capped at four safe ticks",
+          vpot_relative(1, -5) == [bytes([0xB0, 0x10, 0x41])] * 4)
+    check("vpot zero is empty", vpot_relative(1, 0) == [])
+    check("vpot strip8", vpot_relative(8, 1) == [bytes([0xB0, 0x17, 0x01])])
+    check("fixed map has 24 controls", len(KNOB_FIXED_CC) == 24)
+    check("fixed row1 strip1 is CC1", KNOB_FIXED_CC[(1, 1)] == 1)
+    check("fixed row2 strip8 is CC18", KNOB_FIXED_CC[(2, 8)] == 18)
+    check("fixed row3 strip1 is CC71", KNOB_FIXED_CC[(3, 1)] == 71)
+    check("fixed map excludes master CC119", FIXED_MASTER_CC not in KNOB_FIXED_CC.values())
+
+    print("\nSEND ALL protection")
+    protected = VirtualMCU.__new__(VirtualMCU)
+    protected._send_all_pending = []
+    protected._knob_last = {}
+    protected.log = lambda _text: None
+    routed = []
+    protected._route_mix_message = lambda msg: routed.append(msg)
+    base = time.monotonic()
+    for index, cc in enumerate(SEND_ALL_BURST_CCS):
+        protected._handle_from_mix(base + index * 0.001, bytes([0xB0, cc, 64]))
+    check("SEND ALL burst is suppressed", routed == [] and protected._send_all_pending == [])
+    check("SEND ALL never forwards Master", not any(msg[1] == 69 for msg in routed))
+
+    print("\nknob layout state reset + LED cache")
+    stateful = VirtualMCU.__new__(VirtualMCU)
+    stateful._knob_layout = "vpot"
+    stateful._knob_last = {(1, 1): 64}
+    stateful.set_knob_layout("fixed")
+    check("layout reset clears knob baselines", stateful._knob_last == {})
+
+    lamps = VirtualMCU.__new__(VirtualMCU)
+    lamps._logic_led_state = {}
+    lamps.solo_mode_latched = False
+    lamps.quiet = True
+    lamp_messages = []
+    lamps.send_to_mix = lambda msg, note="", log=False: lamp_messages.append(msg)
+    lamps.forward_led_to_mix("mute", 1, True)
+    check("Logic LED state is cached", lamps._logic_led_state[("mute", 1)] is True)
+    check("mute1 paints physical note1", lamp_messages[-1] == bytes([0x90, 1, 127]))
+
+    print("\nsoft-takeover crossing")
+    check("at target", _crosses(50, 80, 80))
+    check("within tolerance", _crosses(50, 79, 80))
+    check("crossed upward", _crosses(70, 85, 80))
+    check("crossed downward", _crosses(90, 75, 80))
+    check("not crossed", not _crosses(50, 60, 80))
+    check("no prev, not at target", not _crosses(None, 60, 80))
 
     print()
     if failures:
         print(f"FAILED: {failures}")
         return 1
-    print("PASS: mcu_surface selfcheck")
+    print("PASS: offline protocol selfcheck")
     return 0
 
 
 def main(argv):
     if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
         print(__doc__)
-        return 2
+        return 0 if len(argv) >= 2 else 2
     cmd = argv[1]
-    if cmd == "run":
+    if cmd == "run" and len(argv) == 2:
         return cmd_run()
-    if cmd == "selfcheck":
+    if cmd == "selfcheck" and len(argv) == 2:
         return cmd_selfcheck()
     print(__doc__)
     return 2

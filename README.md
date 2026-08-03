@@ -1,214 +1,137 @@
-# AKAI MIDI Mix ↔ Logic Pro, without breaking the mGB / Arduinoboy rig
+# AKAI MIDI Mix for Logic Pro
 
-## The thing to know first
+Use an AKAI MIDI Mix as a banked Logic Pro mixer surface. This project creates a
+small virtual Mackie Control bridge so Logic sees the MIDI Mix as a real control
+surface.
 
-**The MIDI Mix will never appear under Logic's Setup → Control Surfaces → Install.**
-That is not a fault and cannot be fixed. Logic only auto-detects devices it has a
-driver module for; the modules compiled into Logic are Axiom, Axiom Pro, AxiomAIR,
-CS-32, FaderMaster, GiO, HUI, iControl, Logic Control, Logic Remote, MCS3,
-microKONTROL, Motormix, Oxygen, Recording Light, SAC-2K and SI-24. The MIDI Mix is
-not among them and has no Mackie/HUI emulation mode in its firmware.
+## Requirements
 
-The supported route is **Controller Assignments** (`Cmd+K`) — a completely separate
-subsystem from Control Surfaces.
+- macOS with Logic Pro
+- AKAI MIDI Mix connected by USB
+- Python 3.9 or newer, installed and available as `python3`
+- Akai's MIDI Mix Editor, once, to load the included hardware preset. Download the
+  [official macOS editor](https://cdn.inmusicbrands.com/akai/MIDImix_Editor_v1.0.7.dmg).
 
-## Preset format
+## Install and configure
 
-Reverse-engineered here and verified against two independent presets. 146 bytes:
+1. Download or clone this repository.
+2. Use Akai's official MIDI Mix Editor to load this repository's included
+   `MIDIMix_LogicProX2026.midimix` preset onto the controller: **File → Open
+   Preset**, choose that file, then **File → Send to Hardware**. Akai's
+   [Logic setup article](https://support.akaipro.com/en/support/solutions/articles/69000824292-akai-pro-midimix-setup-with-logic-pro-x)
+   illustrates the editor workflow.
 
-```
-F0 47 00 31 67 01 0A   <138 payload bytes>   F7
-|  |  |  |  |  |  |
-|  |  |  |  |  `--`--- 7-bit length pair: (0x01 << 7) | 0x0A = 138
-|  |  |  |  `--------- opcode 0x67 = write config
-|  `--`--`------------ Akai / MIDI Mix device id
-`--------------------- SysEx start
+   **Do not download or install Akai's `com.apple.logic.pro.cs` file.** It is a
+   different, preference-replacement mapping, it does not work with this bridge,
+   and replacing that file can overwrite existing Logic Controller Assignments.
+   Do not use Akai's downloadable preset either—load only
+   `MIDIMix_LogicProX2026.midimix` from this repository.
+3. Double-click [mixer-mode.command](mixer-mode.command). Keep its terminal window
+   open while mixing.
+4. In Logic Pro, open **Control Surfaces → Setup**. Add **Mackie Designs → Mackie
+   Control** if it is not already present, and set both its Input and Output to
+   **MIDI Mix MCU**.
+5. In **Logic Pro → Settings → MIDI → Inputs**, disable the real **MIDI Mix** input.
+   The bridge handles that physical port; leave its virtual ports enabled.
+6. Set the physical MASTER once: select Logic's actual Master volume fader, choose
+   **Logic Pro → Control Surfaces → Learn Assignment for Volume**, then move the
+   physical MASTER fader. It learns the bridge's dedicated `MIDI Mix Fixed` message
+   and never follows bank changes.
+7. For normal track banking, set the Mackie control-surface group's **Channel Strip
+   View Mode** to **Tracks** or **Arrange**, not **All**.
 
-payload = 24 knobs  × 2 bytes (channel, cc)    strip order, 3 per strip
-        +  9 faders × 2 bytes (channel, cc)    1–8 then MASTER
-        + 24 buttons × 3 bytes (channel, type, cc)
-```
+## What works
 
-Channel bytes are 0-based on the wire.
+| MIDI Mix control | Logic behavior |
+|---|---|
+| Faders 1–8 | Volume for the current eight-track bank |
+| MASTER fader | Actual Logic Master; fixed and never banked |
+| BANK LEFT / RIGHT | Move by one eight-track bank |
+| MUTE 1–8 | Mute the corresponding tracks |
+| REC ARM 1–8 | Record-enable the corresponding tracks |
+| SOLO key | Tap toggles a solo layer; holding it still enables the hardware solo layer |
+| SEND ALL | Preset-snapshot suppression is implemented; live hardware verification is pending |
+| Knob rows 1–3 | 24 independent, fixed custom-learn controls |
+| Panel lamps | Follow Logic mute, solo, and record-enable feedback |
 
-### The 24-vs-20 button puzzle
+Faders support **soft takeover** (default on): after banking, a fader only takes effect
+once it crosses through Logic's current value, preventing jumps. Both fader mode and
+knob layout can be changed live (type `takeover` or `knobs` in the bridge window) or
+pre-set with `mixer-setup.command`.
 
-The panel has **20 physical buttons** — 8 MUTE, 8 REC ARM, plus SEND ALL, BANK LEFT,
-BANK RIGHT and SOLO — but the preset stores **24 button records**. The extra row of 8
-is the SOLO-shifted MUTE layer. Per the manual: *"Press and hold this button to
-activate the solo feature for the Mute buttons."* That is why no button on the panel
-carries those CCs' label.
+## Knob choices
 
-## Button records are (channel, type, cc)
+`mixer-setup.command` saves the preferred mode:
 
-Not `(type, channel, cc)`, which is what this repo assumed at first. The two
-byte orders are indistinguishable in the stock presets — both store
-`(0, 1, cc)` — so the mistake survived a self-check that happened to use the
-same wrong order. **Hardware measurement settled it:** under `mgb-mode` the
-buttons were observed transmitting on **ch1**, and only `(channel, type, cc)`
-predicts that.
+- **fixed** (default): 24 stable custom-learn controls via the virtual **MIDI Mix
+  Fixed** port. Learn any selected Logic parameter—send level, pan, expression,
+  or a plug-in parameter—to any knob. Each assignment stays tied to that exact
+  Logic target and does not follow fader banking.
+- **vpot**: the established manual Mackie V-Pot behavior. The top physical row adjusts
+  the one standard MCU parameter currently selected in Logic (for example, pan or one
+  send slot) across the current bank. It follows banking and needs no learns.
+- **disabled**: leave the knobs unused.
 
-A retracted claim: this README previously stated that the downloaded 2016
-`MIDIMix_LogicProX.midimix` was broken, with 57 controls collapsing onto 41
-unique addresses. **That was wrong** — an artifact of the byte-order bug, not a
-defect in the file. Decoded correctly it has **57/57 unique addresses**, with the
-three button rows on ch1 / ch3 / ch2, CC22–29 each. It is a perfectly good preset.
+### First-time fixed custom-knob setup
 
-That file also proves the button **channel is freely assignable** — it uses three
-different channels across the rows. `presets/logic-mode.midimix` puts all three
-rows on ch8 with distinct CC blocks, which is equivalent and easier to read.
+Start the bridge and type `learn`. Click the exact Logic parameter, choose **Control
+Surfaces → Learn Assignment for Selected Parameter**, then type `learn <row> <strip>`
+in the bridge window. For example, `learn 2 4` sends the unique CC for row 2, strip 4;
+Logic decides whether that is a send level, expression, pan, or a plug-in parameter.
+`learn master` is available if the Master assignment ever needs to be recreated.
 
-The `type` byte is `1` in both stock presets. Its meaning is still unconfirmed;
-observed behaviour is mixed (some buttons momentary, some toggling), so it is
-probably not the only thing governing that.
+Controller Assignments are stored by Logic globally rather than as a clean per-project
+knob layout. Test a new project before relying on custom learns there.
 
-## Two modes, hot-swappable
+## Known limitations
 
-The device holds one config at a time, so the two rigs live in separate presets. They
-are **fully disjoint** — no (channel, CC) pair appears in both — which means Logic
-assignments learned in Logic mode can never be triggered while the device is in mGB
-mode, and vice versa.
+- The default `fixed` knob assignments are track/parameter locked and do not follow
+  the eight-fader bank. A knob learned to Track 3 remains assigned to Track 3 after
+  the faders bank to tracks 9–16.
+- Mackie Control exposes only one shared bank of eight V-Pots. Consequently, optional
+  `vpot` mode uses only the top physical knob row; rows 2 and 3 are inactive in that
+  mode. The default `fixed` mode bypasses this restriction and exposes all 24 knobs.
+- The MIDI Mix has absolute, non-motorized faders and knobs. Soft takeover prevents
+  most fader jumps after banking, but the hardware cannot move to match Logic. After
+  changing knob modes, the first knob movement establishes its relative baseline.
+- The fixed Master assignment and `fixed` knob learns are global Logic
+  Controller Assignments, not portable per-project mappings.
+- `SEND ALL` has no unique programmable message. The bridge suppresses the snapshot
+  produced by the included preset; another hardware preset may produce a different
+  burst and is unsupported.
+- Run only one bridge instance, and keep its terminal window open while mixing.
 
-| | knobs | faders | buttons |
-|---|---|---|---|
-| **mgb-mode** | ch1, CC1–8 / 11–18 / 21–28 | ch1, CC61–69 | ch1, CC31–38 / 51–58 / 41–48 |
-| **logic-mode** | ch4/5/6, CC22–29 | ch7, CC22–30 | ch8, CC22–29 / 32–39 / 42–49 |
+## Dependencies and security
 
-```sh
-./mgb-mode      # flash for Game Boy / Arduinoboy
-./logic-mode    # flash for Logic mixing
-```
+A virtual environment is not required. The bridge installs no packages and uses only
+Python's standard library plus Apple's local CoreMIDI and CoreFoundation frameworks.
+It performs no network access, automatic downloads, preset flashing, or replacement
+of Logic preference files. A venv would isolate third-party Python packages, but there
+are none here, and it would not sandbox MIDI hardware or Logic.
 
-Verify with `python3 tools/midimix.py diff presets/mgb-mode.midimix presets/logic-mode.midimix`.
+## Daily use
 
-## Tools
+Start `mixer-mode.command`, mix, then type `q` in its terminal window when finished.
+If the bridge is running and Logic does not connect, verify the Mackie Control is using
+**MIDI Mix MCU** for both Input and Output, then restart the bridge.
 
-Pure Python, stdlib only, native arm64 CoreMIDI via ctypes. **The 2015 `MidiMix
-Editor.app` is not needed** — it is x86-only abandonware surviving on Rosetta, which
-Apple is winding down. It is kept in the repo as a reference fallback only.
+## Optional: pre-set preferences
 
-```sh
-python3 tools/midimix.py ports              # list CoreMIDI endpoints
-python3 tools/midimix.py show <preset>      # decode a preset to a table
-python3 tools/midimix.py diff <a> <b>       # check two presets for collisions
-python3 tools/midimix.py mon [preset]       # live monitor -> writes output.md
-python3 tools/midimix.py send <preset>      # flash a preset
-python3 tools/midimix.py dump [out]         # request device config (see below)
-python3 tools/make_logic_preset.py          # regenerate logic-mode.midimix
-python3 tools/selftest.py                   # parser + preset round-trip tests
+Double-click `mixer-setup.command` to choose your knob layout and fader mode before
+starting the bridge. The choices are saved and applied the next time
+`mixer-mode.command` starts. Restart an already-running bridge after changing them.
 
-# Phase 1 — virtual Mackie Control surface (no MIDI Mix needed)
-./mixer-probe                               # keep running; ports named "MIDI Mix MCU"
-python3 tools/mcu_surface.py selfcheck      # algorithm + port create, no Logic
-# In Logic: Control Surfaces → Setup → Install → Mackie Designs → Mackie Control
-# set Input/Output to "MIDI Mix MCU", then in the probe type:  f 1 100
-# Phase 2 — no preset flash required: with the current mGB preset loaded,
-# physical faders ch1 CC61–69 drive Logic volume strips 1–8 plus master.
-# This initial route is direct/absolute; soft takeover is a later refinement.
-# `bank home` / `bank left` / `bank right` are available in the running bridge.
-# The fixed `MIDI Mix Fixed` port emits MASTER as ch16 CC119, reserved for one
-# stable Logic assignment to Master that will not follow MCU banking.
-```
+## Included files
 
-### A note on `MIDIPacketList`
+- `mixer-mode.command` — daily launcher
+- `mixer-setup.command` — knob/fader preference setup
+- `MIDIMix_LogicProX2026.midimix` — required MIDI Mix preset
+- `tools/mcu_surface.py` and `tools/coremidi.py` — the bridge and its small
+  CoreMIDI runtime helper
 
-The first version of the monitor crashed with a **bus error**. CoreMIDI declares
+## License
 
-```c
-struct MIDIPacket     { MIDITimeStamp timeStamp; UInt16 length; Byte data[256]; };
-struct MIDIPacketList { UInt32 numPackets; MIDIPacket packet[1]; };
-```
-
-Natural alignment puts `packet[0]` at offset 8, because `MIDITimeStamp` is 64-bit
-— but on arm64 CoreMIDI wraps both structs in `#pragma pack(4)`, so it actually
-begins at offset **4**. Reading at 8 lands inside the timestamp, produces a garbage
-length, and walks off the end of the buffer. The parser now probes both layouts,
-validates that each packet starts with a real status byte, and bounds every read,
-so malformed input yields nothing instead of killing the process.
-
-The **same trap applies to outgoing messages**, and bit a second time.
-`_packet_list` was built at natural alignment long after the reader was fixed, so
-CoreMIDI took the length from the zero half of the timestamp and sent a zero-length
-packet — no error, no data. Every flash and every LED message silently did nothing.
-`selftest.py` now round-trips built packets back through the reader.
-
-Two other traps in the ctypes bindings, both fatal and both silent:
-
-- **Every function needs `argtypes`.** Without them ctypes passes 64-bit
-  `CFStringRef` pointers as 32-bit ints, truncating them.
-- **`MIDIObjectRef` and friends are `UInt32` typedefs, not pointers.**
-
-`tools/selftest.py` covers the parsing deterministically. It does not exercise
-Apple's own struct construction: CoreMIDI will not deliver a virtual endpoint's
-traffic back to the client that created it, and cross-process virtual endpoints
-did not deliver here either. The real device is the final check.
-
-`dump` sends opcode `0x66`, a guess at the read pairing for the confirmed `0x67`
-write. If the device doesn't answer, nothing is harmed — an unrecognised SysEx is
-ignored — and the exported preset files remain the authoritative backup.
-
-## Backups
-
-- `backups/logic-cs.*.bin` — a copy of `~/Library/Preferences/com.apple.logic.pro.cs`,
-  115 KB, **776 controller-assignment records**. Logic has *no export function* for
-  controller assignments, so this file is the only recovery path. Logic rewrites it on
-  quit, so re-copy after any mapping session.
-- `presets/mgb-mode.midimix` — the working Game Boy config, exported from the device.
-
-**Never drop the 2016 `com.apple.logic.pro.cs` into `~/Library/Preferences`.** Logic has
-no merge or import for assignments; it would replace the live file wholesale and destroy
-all 776 existing records, including the mGB template's. It is kept here as a *reference*
-for the intended mapping only.
-
-## Mapping in Logic
-
-Suspects, in order, for "Learn isn't working":
-
-1. **Order of operations.** Learn is: `Cmd+K` → **Learn Mode** on → **click the
-   on-screen parameter first** so it is focused → *then* move the hardware. Moving the
-   hardware first is the most common reason nothing happens.
-2. **Use Expert view** (bottom-left). It exposes the **Input Message** field — if that
-   reacts when you move a fader, Logic is receiving and only the target is wrong. If it
-   stays dead, Logic is not receiving at all.
-3. **Settings → MIDI → Inputs** — confirm MIDI Mix is enabled.
-4. **Setup → Control Surfaces → Setup** — confirm nothing has claimed the port. A
-   control surface plugin holding it hides the device from Controller Assignments.
-5. **Hardware state.** SOLO is a hold-modifier; BANK L/R shift which channels are
-   controlled.
-
-Target layout for logic-mode:
-
-- Faders 1–8 (ch7 CC22–29) → track **Volume**, tracks 1–8. In Expert view set a
-  **fixed track index per assignment** — left on *Selected Track*, all eight faders
-  fight over whichever track is selected. This is the second-most-common failure.
-- Fader 9 (ch7 CC30) → Master / Output volume
-- Knob row 1 (ch4) → **Pan** · row 2 (ch5) → **Send 1** · row 3 (ch6) → **Send 2**
-- MUTE (ch8 CC22–29) → Mute · REC ARM (ch8 CC32–39) → Record Enable ·
-  SOLO+MUTE (ch8 CC42–49) → Solo
-
-After a mapping session: quit Logic (it flushes the `.cs` on exit), then re-copy it into
-`backups/` and commit.
-
-## Hardware notes
-
-- The manual requires a **powered** hub if you use one. Currently plugged directly into
-  the Mac, which sidesteps this.
-- **SEND ALL** retransmits every control's current position, so software can sync to the
-  physical positions. The manual notes it may do nothing if the software uses pickup or
-  takeover mode.
-- **BANK LEFT / RIGHT — resolved in Phase 3.** They send ch1 **Note 25/26**,
-  respectively—not CC25/26—and are now translated to Logic's MCU Bank
-  Left/Right. Note and CC with the same number do not collide. See
-  `phase3handoff.md`.
-- **SOLO behaviour is inconsistent.** First run: toggle (press to arm, press to
-  leave). Second run: hold, matching the manual. May depend on power-cycle or
-  bank state.
-- **Button behaviour is mixed** — some send 127-on-press / 0-on-release (momentary),
-  others alternate 127 / 0 across presses (toggle). Both look identical on the wire,
-  so Logic sees only "a CC that goes to 127 and later to 0".
-- **The LEDs do not respond to MIDI feedback.** Tested twice: once with broken
-  output (void result), once with confirmed-working output (real result). Neither
-  CC nor Note On messages on any channel light any lamp. The LEDs appear to be
-  firmware-internal only — they reflect the device's own state, not host state.
-  This means neither Controller Assignments nor a translator daemon can light
-  the panel; the lamps will always show whatever the firmware decides.
+The project code and included project files are released under the [MIT License](LICENSE.txt).
+The Akai editor application and vendor manual are deliberately not bundled. The
+repository contains only the files needed to install, run, configure, and document
+the bridge.

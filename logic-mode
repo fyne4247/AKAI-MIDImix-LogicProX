@@ -1,3 +1,0 @@
-#!/bin/sh
-# Flash the MIDI Mix for Logic Pro mixing.
-cd "$(dirname "$0")" && exec python3 tools/midimix.py send presets/logic-mode.midimix
