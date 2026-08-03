@@ -665,7 +665,8 @@ class VirtualMCU:
 
     def _route_mix_message(self, msg: bytes):
         """Translate one physical MIDI Mix message."""
-        if len(msg) >= 3 and msg[1] in MGB_BANK_BUTTON_NOTES:
+        if (len(msg) >= 3 and (msg[0] & 0xF0) in (0x90, 0x80)
+                and msg[1] in MGB_BANK_BUTTON_NOTES):
             self.log(f"← MIDI Mix  {msg.hex(' ')}  [bank]")
         event = parse_mgb_fader(msg)
         if event is not None:
@@ -827,7 +828,7 @@ class VirtualMCU:
             return
         target_strip = strip
 
-        if self.soft_takeover_enabled and strip != 9:
+        if self.soft_takeover_enabled:
             host_val = self.host_faders.get(target_strip)
             if host_val is not None:
                 host_7bit = int(round(host_val * 127))
