@@ -1,0 +1,24 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Runtime state
+.mcu_surface.pid
+.knob_layout
+.soft_takeover
+
+# Local IDE / agent state
+.claude/
+
+# Consolidated local development handoff
+HANDOFF.md
+
+# Third-party and private Logic state
+MidiMix Editor.app/
+MIDImix-UserGuide-v1.0.pdf
+backups/
+com.apple.logic.pro.cs
+
+# Diagnostic output
+output.md
+output/
